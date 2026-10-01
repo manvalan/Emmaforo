@@ -1,0 +1,6 @@
+[submodule "firmware/app-ios"]
+	path = firmware/app-ios
+	url = https://github.com/manvalan/Emmaforo-iOS.git
+[submodule "firmware/app-android"]
+	path = firmware/app-android
+	url = https://github.com/manvalan/Emmaforo-Android.git
