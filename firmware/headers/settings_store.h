@@ -22,4 +22,6 @@ public:
     esp_err_t clear_network() const;
     esp_err_t load_colors(uint8_t *data, size_t size) const;
     esp_err_t save_colors(const uint8_t *data, size_t size) const;
+    esp_err_t load_battery_estimate(uint8_t *percent, bool *has_percent, bool *climb) const;
+    esp_err_t save_battery_estimate(bool has_percent, uint8_t percent, bool climb) const;
 };

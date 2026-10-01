@@ -19,7 +19,8 @@ public:
     void scan_networks();
     void set_battery_measurement(uint8_t percentage, uint16_t millivolts, bool charging,
                                  uint8_t charge_status, uint8_t fault, bool safe_charging,
-                                 bool charge_paused, bool gentle_charge, bool estimate_valid);
+                                 bool charge_paused, bool gentle_charge, bool estimate_valid,
+                                 bool power_good);
     bool take_charge_pause(bool *paused);
     bool take_gentle_charge(bool *gentle);
     bool take_shutdown();

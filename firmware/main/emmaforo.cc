@@ -106,6 +106,55 @@ static void print_banner(void)
     ESP_LOGI(TAG, "");
 }
 
+struct ChargeWindow {
+    bool allow;
+    bool climb;
+    bool reached_stop;
+};
+
+static ChargeWindow safe_charge_window(bool safe_mode, bool user_paused, bool climb,
+                                        bool percent_known, uint8_t percent)
+{
+    ChargeWindow decision = {true, false, false};
+    if (user_paused) {
+        decision.allow = false;
+        decision.climb = climb;
+        return decision;
+    }
+    if (!safe_mode) {
+        return decision;
+    }
+    if (!percent_known) {
+        decision.allow = false;
+        return decision;
+    }
+    if (percent >= kChargeStopPercentage) {
+        decision.allow = false;
+        decision.reached_stop = true;
+        return decision;
+    }
+    if (percent <= kChargeResumePercentage) {
+        decision.allow = true;
+        decision.climb = true;
+        return decision;
+    }
+    if (climb) {
+        decision.allow = true;
+        decision.climb = true;
+        return decision;
+    }
+    decision.allow = false;
+    return decision;
+}
+
+static void apply_charger_enable(BQ &charger, bool charger_ready, bool allow, bool *charging_enabled)
+{
+    if (!charger_ready || charging_enabled == nullptr || allow == *charging_enabled) return;
+    if (charger.BQ_set_charging_enabled(allow) == ESP_OK) {
+        *charging_enabled = allow;
+    }
+}
+
 static int probe_bq25896_addresses(i2c_master_bus_handle_t bus_handle)
 {
     esp_err_t ret = i2c_master_probe(bus_handle, BQ::kDefaultAddress, I2C_TIMEOUT_MS);
@@ -184,6 +233,7 @@ extern "C" void app_main(void)
     ret = charger.BQ_begin();
     const bool charger_ready = ret == ESP_OK;
     bool charging_enabled = charger_ready;
+    Bq25896EstimateSource battery_gauge;
     if (charger_ready) {
         ESP_LOGI(TAG, "BQ25896 driver initialized at 0x%02X", BQ::kDefaultAddress);
     } else {
@@ -224,6 +274,22 @@ extern "C" void app_main(void)
     bool logged_ble_hold = false;
     bool resting = false;
     bool user_charge_paused = network_settings.charge_paused != 0;
+    uint8_t remembered_percent = 0;
+    bool remembered_known = false;
+    bool charge_climb = false;
+    bool saved_climb = false;
+    if (settings_store.load_battery_estimate(&remembered_percent, &remembered_known, &charge_climb) != ESP_OK) {
+        ESP_LOGW(TAG, "Battery estimate was not restored");
+        remembered_known = false;
+        charge_climb = false;
+    }
+    if (remembered_known) {
+        battery_gauge.restore(remembered_percent);
+        saved_climb = charge_climb;
+        ESP_LOGI(TAG, "Battery estimate restored at %u%%", remembered_percent);
+    } else {
+        charge_climb = false;
+    }
     ESP_LOGI(TAG, "Stored network joins unless a phone holds Bluetooth");
     if (charger_ready) {
         if (charger.BQ_pet_watchdog() != ESP_OK) {
@@ -237,8 +303,28 @@ extern "C" void app_main(void)
         if (charger.BQ_set_charge_current_ma(charge_ma) != ESP_OK) {
             ESP_LOGW(TAG, "Charge current was not applied");
         }
-        if (user_charge_paused && charger.BQ_set_charging_enabled(false) == ESP_OK) {
-            charging_enabled = false;
+        const ChargeWindow boot_window = safe_charge_window(
+            network_settings.safe_charging_mode != 0, user_charge_paused, charge_climb,
+            remembered_known, remembered_percent);
+        charge_climb = boot_window.climb;
+        apply_charger_enable(charger, charger_ready, boot_window.allow, &charging_enabled);
+        if (boot_window.reached_stop && remembered_known) {
+            battery_gauge.anchor(kChargeStopPercentage);
+            remembered_percent = kChargeStopPercentage;
+        }
+        if (!boot_window.allow) {
+            if (user_charge_paused) {
+                ESP_LOGI(TAG, "Charging paused");
+            } else if (boot_window.reached_stop) {
+                ESP_LOGI(TAG, "Battery at %u%%: charging paused", kChargeStopPercentage);
+            } else if (remembered_known) {
+                ESP_LOGI(TAG, "Battery at %u%%: safe charge stays off", remembered_percent);
+            } else {
+                ESP_LOGI(TAG, "Safe charge stays off until the estimate is %u%% or below",
+                         kChargeResumePercentage);
+            }
+        } else if (network_settings.safe_charging_mode != 0) {
+            ESP_LOGI(TAG, "Battery at %u%%: charging resumed", remembered_percent);
         }
     }
 
@@ -292,7 +378,6 @@ extern "C" void app_main(void)
     uint32_t led_blink_interval_ms = 1000;
     uint8_t led_level = 255;
     bool configuration_led_mode = false;
-    Bq25896EstimateSource battery_gauge;
     BatteryStatusSource &battery = battery_gauge;
 
     while (1) {
@@ -384,13 +469,7 @@ extern "C" void app_main(void)
             if (settings_store.save(network_settings) != ESP_OK) {
                 ESP_LOGE(TAG, "Could not save charge pause");
             }
-            if (charger_ready) {
-                const bool enable = !user_charge_paused;
-                if (charger.BQ_set_charging_enabled(enable) == ESP_OK) {
-                    charging_enabled = enable;
-                    ESP_LOGI(TAG, "Charging manually %s", enable ? "resumed" : "paused");
-                }
-            }
+            ESP_LOGI(TAG, "Charging manually %s", user_charge_paused ? "paused" : "resumed");
         }
 
         bool gentle_charge = network_settings.gentle_charge != 0;
@@ -569,21 +648,42 @@ extern "C" void app_main(void)
         uint8_t fault = 0;
         if (charger.BQ_get_fault(&fault) == ESP_OK) status.fault = fault;
 
-        if (charger_ready && safe_mode && !user_charge_paused && status.valid && charging_enabled &&
-            status.percent >= kChargeStopPercentage) {
-            if (charger.BQ_set_charging_enabled(false) == ESP_OK) {
-                charging_enabled = false;
-                battery.anchor(kChargeStopPercentage);
-                status.percent = kChargeStopPercentage;
-                status.charging = false;
-                ESP_LOGI(TAG, "Battery at %u%%: charging paused", status.percent);
-            }
-        } else if (charger_ready && safe_mode && !user_charge_paused && status.valid && !charging_enabled &&
-                   status.charge_state != static_cast<uint8_t>(BQ::ChargeStatus::ChargeDone) &&
-                   status.percent <= kChargeResumePercentage) {
-            if (charger.BQ_set_charging_enabled(true) == ESP_OK) {
-                charging_enabled = true;
+        const ChargeWindow window = safe_charge_window(safe_mode, user_charge_paused, charge_climb,
+                                                       status.valid, status.percent);
+        const bool was_charging = charging_enabled;
+        charge_climb = window.climb;
+        apply_charger_enable(charger, charger_ready, window.allow, &charging_enabled);
+        if (window.reached_stop && !charging_enabled) {
+            battery.anchor(kChargeStopPercentage);
+            status.percent = kChargeStopPercentage;
+            status.valid = true;
+        }
+        if (!charging_enabled) status.charging = false;
+        if (was_charging != charging_enabled) {
+            if (charging_enabled && status.valid) {
                 ESP_LOGI(TAG, "Battery at %u%%: charging resumed", status.percent);
+            } else if (user_charge_paused) {
+                ESP_LOGI(TAG, "Charging paused");
+            } else if (window.reached_stop) {
+                ESP_LOGI(TAG, "Battery at %u%%: charging paused", status.percent);
+            } else if (status.valid) {
+                ESP_LOGI(TAG, "Battery at %u%%: safe charge stays off", status.percent);
+            } else {
+                ESP_LOGI(TAG, "Safe charge stays off until the estimate is %u%% or below",
+                         kChargeResumePercentage);
+            }
+        }
+        uint8_t live_percent = 0;
+        const bool live_known = battery_gauge.estimate(&live_percent);
+        if (live_known != remembered_known || (live_known && live_percent != remembered_percent) ||
+            charge_climb != saved_climb) {
+            if (settings_store.save_battery_estimate(live_known, live_known ? live_percent : 0, charge_climb) ==
+                ESP_OK) {
+                remembered_known = live_known;
+                if (live_known) remembered_percent = live_percent;
+                saved_climb = charge_climb;
+            } else {
+                ESP_LOGW(TAG, "Battery estimate was not stored");
             }
         }
 
@@ -593,6 +693,7 @@ extern "C" void app_main(void)
         g_published_battery.charge_status = status.charge_state;
         g_published_battery.fault = status.fault;
         g_published_battery.valid = status.valid;
+        g_published_battery.power_good = status.power_good;
         std::snprintf(g_published_info.name, sizeof(g_published_info.name), "%s", network_settings.device_name);
         std::snprintf(g_published_info.wifi, sizeof(g_published_info.wifi), "%s", network_settings.ssid);
         g_published_info.wifi_saved = network_settings.ssid[0] != '\0';
@@ -612,7 +713,7 @@ extern "C" void app_main(void)
             bluetooth.set_battery_measurement(status.percent, status.voltage_mv, status.charging,
                                               status.charge_state, status.fault, safe_mode,
                                               user_charge_paused, network_settings.gentle_charge != 0,
-                                              status.valid);
+                                              status.valid, status.power_good);
         }
 
         if (status.voltage_mv != 0 || status.charge_state != 255) {

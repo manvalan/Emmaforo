@@ -245,11 +245,12 @@ esp_err_t SetupPortal::battery_handler(httpd_req_t *request)
     if (!published.valid && published.voltage_mv == 0) {
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Battery unavailable");
     }
-    char response[160];
+    char response[192];
     std::snprintf(response, sizeof(response),
-                  "{\"percentage\":%u,\"voltage_mv\":%u,\"charging\":%s,\"charge_status\":%u,\"fault\":%u,\"estimated\":%s}",
+                  "{\"percentage\":%u,\"voltage_mv\":%u,\"charging\":%s,\"charge_status\":%u,\"fault\":%u,\"estimated\":%s,\"power\":%s}",
                   published.percentage, published.voltage_mv, published.charging ? "true" : "false",
-                  published.charge_status, published.fault, published.valid ? "true" : "false");
+                  published.charge_status, published.fault, published.valid ? "true" : "false",
+                  published.power_good ? "true" : "false");
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
 }
@@ -320,14 +321,15 @@ esp_err_t SetupPortal::info_handler(httpd_req_t *request)
                   "\"safe\":%s,\"paused\":%s,\"gentle\":%s,\"colors\":%u,"
                   "\"serial\":\"%s\",\"firmware\":\"%s\",\"preset\":\"%s\","
                   "\"percentage\":%u,\"voltage_mv\":%u,\"charging\":%s,\"charge_status\":%u,"
-                  "\"fault\":%u,\"estimated\":%s}",
+                  "\"fault\":%u,\"estimated\":%s,\"power\":%s}",
                   name, wifi, published.wifi_saved ? "true" : "false",
                   published.password_saved ? "true" : "false",
                   published.safe ? "true" : "false", published.paused ? "true" : "false",
                   published.gentle ? "true" : "false", published.colors,
                   published.serial, published.firmware, preset,
                   battery.percentage, battery.voltage_mv, battery.charging ? "true" : "false",
-                  battery.charge_status, battery.fault, battery.valid ? "true" : "false");
+                  battery.charge_status, battery.fault, battery.valid ? "true" : "false",
+                  battery.power_good ? "true" : "false");
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
 }

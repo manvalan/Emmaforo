@@ -54,13 +54,14 @@ bool battery_safe = true;
 bool battery_paused = false;
 bool battery_gentle = false;
 bool battery_estimate_valid = false;
+bool battery_power_good = false;
 bool charge_pause_requested = false;
 bool pending_pause_value = false;
 bool gentle_charge_requested = false;
 bool pending_gentle_value = false;
 bool shutdown_requested = false;
 char network_status[96] = {};
-char last_battery_notification[48] = {};
+char last_battery_notification[64] = {};
 uint8_t color_preset[kColorPresetSize] = {};
 uint8_t pending_color_preset[kColorPresetSize] = {};
 bool color_preset_requested = false;
@@ -99,12 +100,12 @@ const ble_uuid16_t kFirmwareApproveUuid = BLE_UUID16_INIT(0xFFEE);
 
 int format_battery(char *measurement, size_t size)
 {
-    return std::snprintf(measurement, size, "%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u",
+    return std::snprintf(measurement, size, "%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u",
                          battery_percentage, battery_voltage_mv,
                          battery_charging ? 1 : 0, battery_charge_status,
                          battery_fault, battery_safe ? 1 : 0,
                          battery_paused ? 1 : 0, battery_gentle ? 1 : 0,
-                         battery_estimate_valid ? 1 : 0);
+                         battery_estimate_valid ? 1 : 0, battery_power_good ? 1 : 0);
 }
 int on_gap_event(struct ble_gap_event *event, void *arg);
 
@@ -153,7 +154,7 @@ int gatt_access(uint16_t, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctx
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR && ctxt->chr != nullptr &&
         ble_uuid_cmp(ctxt->chr->uuid, &kBatteryUuid.u) == 0) {
         if (!battery_measurement_valid) return BLE_ATT_ERR_UNLIKELY;
-        char measurement[48] = {};
+        char measurement[64] = {};
         const int length = format_battery(measurement, sizeof(measurement));
         if (length <= 0) return BLE_ATT_ERR_UNLIKELY;
         if (ctxt->offset >= static_cast<uint16_t>(length)) return 0;
@@ -580,7 +581,8 @@ bool BluetoothManager::take_scan_request()
 void BluetoothManager::set_battery_measurement(uint8_t percentage, uint16_t millivolts,
                                                bool charging, uint8_t charge_status, uint8_t fault,
                                                bool safe_charging, bool charge_paused,
-                                               bool gentle_charge, bool estimate_valid)
+                                               bool gentle_charge, bool estimate_valid,
+                                               bool power_good)
 {
     battery_percentage = percentage > 100 ? 100 : percentage;
     battery_voltage_mv = millivolts;
@@ -591,6 +593,7 @@ void BluetoothManager::set_battery_measurement(uint8_t percentage, uint16_t mill
     battery_paused = charge_paused;
     battery_gentle = gentle_charge;
     battery_estimate_valid = estimate_valid;
+    battery_power_good = power_good;
     battery_measurement_valid = true;
 
     char measurement[sizeof(last_battery_notification)] = {};

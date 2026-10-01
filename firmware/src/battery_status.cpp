@@ -13,6 +13,11 @@ constexpr uint32_t kCellCapacityMilliampHours = 900;
 // The cell voltage stays high while the charger is attached, and for a
 // while after it lets go. Do not replace the integrated percent in that moment.
 constexpr int64_t kRestBeforeVoltageUs = 10LL * 60 * 1000000;
+// 4150 mV is already 95% on the curve, and 4200 mV is 100%. That range is the
+// charger plateau, not a rested cell. A lower reading after charging has
+// stopped can become the first estimate.
+constexpr uint16_t kChargerPlateauMillivolts = 4150;
+constexpr int64_t kRelaxBeforeVoltageUs = 60LL * 1000000;
 }
 
 BatteryStatus Bq25896EstimateSource::read(BQ &charger, bool lamp_on, bool safe_mode)
@@ -32,6 +37,7 @@ BatteryStatus Bq25896EstimateSource::read(BQ &charger, bool lamp_on, bool safe_m
     uint8_t status_register = 0;
     const bool power_known = charger.BQ_read_register(kRegStatus, &status_register) == ESP_OK;
     const bool power_good = power_known && (status_register & kPowerGoodMask) != 0;
+    status.power_good = power_good;
 
     const bool charging = status_ok && (charge_status == BQ::ChargeStatus::PreCharge ||
                                         charge_status == BQ::ChargeStatus::FastCharge);
@@ -56,6 +62,7 @@ BatteryStatus Bq25896EstimateSource::read(BQ &charger, bool lamp_on, bool safe_m
 
     if (charging) {
         unplugged_since_us_ = 0;
+        charge_idle_since_us_ = 0;
         if (phase_ != Phase::Charging) {
             dt_ms = 0;
             if (valid_) {
@@ -81,8 +88,22 @@ BatteryStatus Bq25896EstimateSource::read(BQ &charger, bool lamp_on, bool safe_m
         // Keep the last percent. A missed status read is not a rested cell.
     } else if (power_good || charge_done) {
         unplugged_since_us_ = 0;
+        if (charge_idle_since_us_ == 0) charge_idle_since_us_ = now_us;
         if (valid_ && phase_ == Phase::Rested) {
             phase_ = Phase::Holding;
+        }
+        const bool relaxed = voltage_ok && voltage_mv < kChargerPlateauMillivolts &&
+                             now_us - charge_idle_since_us_ >= kRelaxBeforeVoltageUs;
+        if (!valid_ && !lamp_on && !charge_done && relaxed) {
+            uint8_t rested = 0;
+            if (charger.BQ_get_battery_percentage(voltage_mv, &rested) == ESP_OK) {
+                percent_ = rested;
+                anchor_ = rested;
+                valid_ = true;
+                phase_ = Phase::Holding;
+                charge_milliamp_milliseconds_ = 0;
+                ESP_LOGI(kTag, "Charge estimate from rested voltage %u mV is %u%%", voltage_mv, percent_);
+            }
         }
     } else {
         if (unplugged_since_us_ == 0) unplugged_since_us_ = now_us;
@@ -115,4 +136,21 @@ void Bq25896EstimateSource::anchor(uint8_t percent)
     valid_ = true;
     phase_ = Phase::Holding;
     charge_milliamp_milliseconds_ = 0;
+}
+
+void Bq25896EstimateSource::restore(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    percent_ = percent;
+    anchor_ = percent;
+    valid_ = true;
+    phase_ = Phase::Holding;
+    charge_milliamp_milliseconds_ = 0;
+}
+
+bool Bq25896EstimateSource::estimate(uint8_t *percent) const
+{
+    if (percent == nullptr || !valid_) return false;
+    *percent = percent_;
+    return true;
 }

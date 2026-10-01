@@ -15,6 +15,7 @@ struct PublishedBattery {
     uint8_t charge_status;
     uint8_t fault;
     bool valid;
+    bool power_good;
 };
 
 struct PublishedInfo {

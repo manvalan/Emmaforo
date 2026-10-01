@@ -11,6 +11,7 @@ struct BatteryStatus {
     uint8_t fault;
     bool charging;
     bool valid;
+    bool power_good;
 };
 
 class BatteryStatusSource {
@@ -24,6 +25,8 @@ class Bq25896EstimateSource : public BatteryStatusSource {
 public:
     BatteryStatus read(BQ &charger, bool lamp_on, bool safe_mode) override;
     void anchor(uint8_t percent) override;
+    void restore(uint8_t percent);
+    bool estimate(uint8_t *percent) const;
 
 private:
     enum class Phase : uint8_t { Unknown, Rested, Charging, Holding };
@@ -35,6 +38,7 @@ private:
     uint64_t charge_milliamp_milliseconds_ = 0;
     int64_t last_us_ = 0;
     int64_t unplugged_since_us_ = 0;
+    int64_t charge_idle_since_us_ = 0;
 };
 
 // Not fitted and not probed. A later MAX17048G+ can implement this and

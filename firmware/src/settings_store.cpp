@@ -13,6 +13,8 @@ constexpr char kSafeChargingKey[] = "safe_charging";
 constexpr char kGentleChargeKey[] = "charge_gentle";
 constexpr char kChargePausedKey[] = "charge_paused";
 constexpr char kLampColorsKey[] = "lamp_colors";
+constexpr char kBatteryPercentKey[] = "battery_pct";
+constexpr char kChargeClimbKey[] = "charge_climb";
 }
 
 esp_err_t SettingsStore::load(NetworkSettings *settings) const
@@ -149,6 +151,62 @@ esp_err_t SettingsStore::save_colors(const uint8_t *data, size_t size) const
         return ret;
     }
     ret = nvs_set_blob(handle, kLampColorsKey, data, kLampColorPresetSize);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return ret;
+}
+
+esp_err_t SettingsStore::load_battery_estimate(uint8_t *percent, bool *has_percent, bool *climb) const
+{
+    if (percent == nullptr || has_percent == nullptr || climb == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *percent = 0;
+    *has_percent = false;
+    *climb = false;
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(kNamespace, NVS_READONLY, &handle);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    uint8_t stored_percent = 0;
+    esp_err_t percent_ret = nvs_get_u8(handle, kBatteryPercentKey, &stored_percent);
+    if (percent_ret == ESP_OK && stored_percent <= 100) {
+        *percent = stored_percent;
+        *has_percent = true;
+    } else if (percent_ret != ESP_OK && percent_ret != ESP_ERR_NVS_NOT_FOUND) {
+        ret = percent_ret;
+    }
+    uint8_t stored_climb = 0;
+    esp_err_t climb_ret = nvs_get_u8(handle, kChargeClimbKey, &stored_climb);
+    if (climb_ret == ESP_OK) {
+        *climb = stored_climb != 0;
+    } else if (climb_ret != ESP_ERR_NVS_NOT_FOUND) {
+        ret = climb_ret;
+    }
+    nvs_close(handle);
+    return ret;
+}
+
+esp_err_t SettingsStore::save_battery_estimate(bool has_percent, uint8_t percent, bool climb) const
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(kNamespace, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (has_percent) {
+        if (percent > 100) percent = 100;
+        ret = nvs_set_u8(handle, kBatteryPercentKey, percent);
+    }
+    if (ret == ESP_OK) {
+        ret = nvs_set_u8(handle, kChargeClimbKey, climb ? 1 : 0);
+    }
     if (ret == ESP_OK) {
         ret = nvs_commit(handle);
     }
