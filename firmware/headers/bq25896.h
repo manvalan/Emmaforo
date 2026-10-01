@@ -24,6 +24,7 @@ public:
     esp_err_t BQ_write_register(uint8_t reg, uint8_t value);
     esp_err_t BQ_update_register(uint8_t reg, uint8_t mask, uint8_t value);
     esp_err_t BQ_set_charge_current_ma(uint16_t milliamps);
+    esp_err_t BQ_get_charge_current_setting_ma(uint16_t *milliamps) const;
     esp_err_t BQ_set_charge_voltage_mv(uint16_t millivolts);
     esp_err_t BQ_set_input_current_limit_ma(uint16_t milliamps);
     esp_err_t BQ_set_charging_enabled(bool enabled);

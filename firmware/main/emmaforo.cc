@@ -6,6 +6,7 @@
 #include "bq25896.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_pm.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -73,10 +74,17 @@ static constexpr char kApPassword[] = "emmaforo";
 static const char *TAG = "I2C_SCAN";
 
 static PublishedBattery g_published_battery = {};
+static PublishedInfo g_published_info = {};
+static char g_serial[18] = {};
 
 PublishedBattery emmaforo_published_battery()
 {
     return g_published_battery;
+}
+
+PublishedInfo emmaforo_published_info()
+{
+    return g_published_info;
 }
 
 void emmaforo_note_wifi_use()
@@ -184,6 +192,12 @@ extern "C" void app_main(void)
 
     firmware_update_load();
     ESP_LOGI(TAG, "Firmware version %s", firmware_version());
+    uint8_t factory_mac[6] = {};
+    if (esp_efuse_mac_get_default(factory_mac) == ESP_OK) {
+        std::snprintf(g_serial, sizeof(g_serial), "%02X:%02X:%02X:%02X:%02X:%02X",
+                      factory_mac[0], factory_mac[1], factory_mac[2],
+                      factory_mac[3], factory_mac[4], factory_mac[5]);
+    }
 
     SettingsStore settings_store;
     NetworkSettings network_settings = {};
@@ -379,17 +393,24 @@ extern "C" void app_main(void)
             }
         }
 
-        bool gentle_charge = false;
-        if (bluetooth.take_gentle_charge(&gentle_charge)) {
-            network_settings.gentle_charge = gentle_charge ? 1 : 0;
-            if (settings_store.save(network_settings) != ESP_OK) {
-                ESP_LOGE(TAG, "Could not save charge current");
-            }
+        bool gentle_charge = network_settings.gentle_charge != 0;
+        bool current_changed = false;
+        if (bluetooth.take_gentle_charge(&gentle_charge)) current_changed = true;
+        bool http_gentle = false;
+        if (portal.take_charge_current(&http_gentle)) {
+            gentle_charge = http_gentle;
+            current_changed = true;
+        }
+        if (current_changed) {
             if (charger_ready) {
                 const uint16_t charge_ma = gentle_charge ? kGentleChargeMilliamps : kNormalChargeMilliamps;
                 if (charger.BQ_set_charge_current_ma(charge_ma) != ESP_OK) {
                     ESP_LOGW(TAG, "Charge current was not applied");
                 }
+            }
+            network_settings.gentle_charge = gentle_charge ? 1 : 0;
+            if (settings_store.save(network_settings) != ESP_OK) {
+                ESP_LOGE(TAG, "Could not save charge current");
             }
         }
 
@@ -398,6 +419,7 @@ extern "C" void app_main(void)
             if (settings_store.save_colors(updated_colors, sizeof(updated_colors)) != ESP_OK) {
                 ESP_LOGE(TAG, "Could not save color preset");
             } else {
+                std::memcpy(stored_colors, updated_colors, sizeof(stored_colors));
                 ESP_LOGI(TAG, "Color preset stored on the board");
             }
         }
@@ -571,6 +593,21 @@ extern "C" void app_main(void)
         g_published_battery.charge_status = status.charge_state;
         g_published_battery.fault = status.fault;
         g_published_battery.valid = status.valid;
+        std::snprintf(g_published_info.name, sizeof(g_published_info.name), "%s", network_settings.device_name);
+        std::snprintf(g_published_info.wifi, sizeof(g_published_info.wifi), "%s", network_settings.ssid);
+        g_published_info.wifi_saved = network_settings.ssid[0] != '\0';
+        g_published_info.password_saved = network_settings.password[0] != '\0';
+        g_published_info.safe = network_settings.safe_charging_mode != 0;
+        g_published_info.paused = user_charge_paused;
+        g_published_info.gentle = network_settings.gentle_charge != 0;
+        unsigned published_colors = 0;
+        for (int index = 0; index < 8; ++index) {
+            if ((stored_colors[0] & (1u << index)) != 0) published_colors++;
+        }
+        g_published_info.colors = static_cast<uint8_t>(published_colors);
+        std::snprintf(g_published_info.serial, sizeof(g_published_info.serial), "%s", g_serial);
+        std::snprintf(g_published_info.firmware, sizeof(g_published_info.firmware), "%s", firmware_version());
+        std::memcpy(g_published_info.preset, stored_colors, sizeof(g_published_info.preset));
         if (status.voltage_mv != 0 || status.charge_state != 255) {
             bluetooth.set_battery_measurement(status.percent, status.voltage_mv, status.charging,
                                               status.charge_state, status.fault, safe_mode,

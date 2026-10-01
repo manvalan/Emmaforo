@@ -16,6 +16,8 @@ char pending_password[64] = {};
 bool apply_requested = false;
 bool charging_command_requested = false;
 bool charging_command_enabled = true;
+bool current_command_requested = false;
+bool current_command_gentle = true;
 bool shutdown_command_requested = false;
 bool led_command_requested = false;
 SerialRgbLed::Color pending_led_color = {0, 0, 0};
@@ -103,6 +105,7 @@ esp_err_t SetupPortal::begin(BQ &charger, SerialRgbLed &rgb_led)
     charger_ = &charger;
     rgb_led_ = &rgb_led;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 16;
     esp_err_t ret = httpd_start(&server_, &config);
     if (ret != ESP_OK) return ret;
     active_portal = this;
@@ -115,13 +118,17 @@ esp_err_t SetupPortal::begin(BQ &charger, SerialRgbLed &rgb_led)
     httpd_uri_t charging = {"/api/charging", HTTP_POST, charging_handler, nullptr};
     httpd_uri_t shutdown = {"/api/shutdown", HTTP_POST, shutdown_handler, nullptr};
     httpd_uri_t led = {"/api/led", HTTP_POST, led_handler, nullptr};
+    httpd_uri_t info = {"/api/info", HTTP_GET, info_handler, nullptr};
+    httpd_uri_t current = {"/api/current", HTTP_POST, current_handler, nullptr};
     httpd_register_uri_handler(server_, &index);
     httpd_register_uri_handler(server_, &scan);
     httpd_register_uri_handler(server_, &configure);
     httpd_register_uri_handler(server_, &battery);
     httpd_register_uri_handler(server_, &charging);
     httpd_register_uri_handler(server_, &shutdown);
-    return httpd_register_uri_handler(server_, &led);
+    httpd_register_uri_handler(server_, &led);
+    httpd_register_uri_handler(server_, &info);
+    return httpd_register_uri_handler(server_, &current);
 }
 
 esp_err_t SetupPortal::stop()
@@ -151,6 +158,14 @@ bool SetupPortal::take_charging_command(bool *enabled)
     if (!charging_command_requested || enabled == nullptr) return false;
     *enabled = charging_command_enabled;
     charging_command_requested = false;
+    return true;
+}
+
+bool SetupPortal::take_charge_current(bool *gentle)
+{
+    if (!current_command_requested || gentle == nullptr) return false;
+    *gentle = current_command_gentle;
+    current_command_requested = false;
     return true;
 }
 
@@ -251,6 +266,70 @@ esp_err_t SetupPortal::charging_handler(httpd_req_t *request)
     charging_command_requested = true;
     if (app_task_handle != nullptr) xTaskNotifyGive(app_task_handle);
     return httpd_resp_sendstr(request, "OK");
+}
+
+esp_err_t SetupPortal::current_handler(httpd_req_t *request)
+{
+    char body[32] = {};
+    char gentle[8] = {};
+    const int received = httpd_req_recv(request, body, sizeof(body) - 1);
+    if (received <= 0 || !parameter(body, "gentle", gentle, sizeof(gentle)) ||
+        (gentle[0] != '0' && gentle[0] != '1')) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Missing gentle");
+    }
+    current_command_gentle = gentle[0] == '1';
+    current_command_requested = true;
+    if (app_task_handle != nullptr) xTaskNotifyGive(app_task_handle);
+    return httpd_resp_sendstr(request, "OK");
+}
+
+void json_escape(const char *source, char *target, size_t target_size)
+{
+    size_t output = 0;
+    if (target_size == 0) return;
+    for (const char *cursor = source; *cursor != '\0' && output + 2 < target_size; ++cursor) {
+        const unsigned char value = static_cast<unsigned char>(*cursor);
+        if (value == '"' || value == '\\') {
+            if (output + 3 >= target_size) break;
+            target[output++] = '\\';
+            target[output++] = static_cast<char>(value);
+        } else if (value < 0x20) {
+            continue;
+        } else {
+            target[output++] = static_cast<char>(value);
+        }
+    }
+    target[output] = '\0';
+}
+
+esp_err_t SetupPortal::info_handler(httpd_req_t *request)
+{
+    const PublishedInfo published = emmaforo_published_info();
+    const PublishedBattery battery = emmaforo_published_battery();
+    char name[96] = {};
+    char wifi[160] = {};
+    char preset[51] = {};
+    json_escape(published.name, name, sizeof(name));
+    json_escape(published.wifi, wifi, sizeof(wifi));
+    for (int index = 0; index < 25; ++index) {
+        std::snprintf(preset + index * 2, 3, "%02x", published.preset[index]);
+    }
+    char response[1024];
+    std::snprintf(response, sizeof(response),
+                  "{\"name\":\"%s\",\"wifi\":\"%s\",\"wifi_saved\":%s,\"password_saved\":%s,"
+                  "\"safe\":%s,\"paused\":%s,\"gentle\":%s,\"colors\":%u,"
+                  "\"serial\":\"%s\",\"firmware\":\"%s\",\"preset\":\"%s\","
+                  "\"percentage\":%u,\"voltage_mv\":%u,\"charging\":%s,\"charge_status\":%u,"
+                  "\"fault\":%u,\"estimated\":%s}",
+                  name, wifi, published.wifi_saved ? "true" : "false",
+                  published.password_saved ? "true" : "false",
+                  published.safe ? "true" : "false", published.paused ? "true" : "false",
+                  published.gentle ? "true" : "false", published.colors,
+                  published.serial, published.firmware, preset,
+                  battery.percentage, battery.voltage_mv, battery.charging ? "true" : "false",
+                  battery.charge_status, battery.fault, battery.valid ? "true" : "false");
+    httpd_resp_set_type(request, "application/json");
+    return httpd_resp_send(request, response, HTTPD_RESP_USE_STRLEN);
 }
 
 esp_err_t SetupPortal::shutdown_handler(httpd_req_t *request)

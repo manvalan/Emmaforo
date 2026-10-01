@@ -26,12 +26,15 @@ public:
     void anchor(uint8_t percent) override;
 
 private:
+    enum class Phase : uint8_t { Unknown, Rested, Charging, Holding };
+
     uint8_t percent_ = 0;
     uint8_t anchor_ = 0;
     bool valid_ = false;
-    bool integral_open_ = false;
+    Phase phase_ = Phase::Unknown;
     uint64_t charge_milliamp_milliseconds_ = 0;
     int64_t last_us_ = 0;
+    int64_t unplugged_since_us_ = 0;
 };
 
 // Not fitted and not probed. A later MAX17048G+ can implement this and

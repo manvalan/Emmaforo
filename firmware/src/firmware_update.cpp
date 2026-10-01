@@ -28,15 +28,24 @@ bool busy = false;
 bool attempt_now = false;
 int64_t last_attempt_us = 0;
 
-bool digits_only(const char *version)
+bool version_text(const char *version)
 {
     if (version == nullptr || version[0] == '\0' || std::strlen(version) >= sizeof(approved)) {
         return false;
     }
+    int dots = 0;
+    bool digit = false;
     for (const char *cursor = version; *cursor != '\0'; ++cursor) {
+        if (*cursor == '.') {
+            if (!digit || dots == 1) return false;
+            dots++;
+            digit = false;
+            continue;
+        }
         if (*cursor < '0' || *cursor > '9') return false;
+        digit = true;
     }
-    return true;
+    return digit;
 }
 
 esp_err_t read_note_version(char *version, size_t version_size)
@@ -63,7 +72,7 @@ esp_err_t read_note_version(char *version, size_t version_size)
 
     char *line_end = std::strpbrk(buffer, "\r\n");
     if (line_end != nullptr) *line_end = '\0';
-    if (!digits_only(buffer)) return ESP_ERR_INVALID_VERSION;
+    if (!version_text(buffer)) return ESP_ERR_INVALID_VERSION;
     std::snprintf(version, version_size, "%s", buffer);
     return ESP_OK;
 }
@@ -166,15 +175,18 @@ void firmware_update_load()
     nvs_handle_t handle;
     if (nvs_open(kNamespace, NVS_READONLY, &handle) != ESP_OK) return;
     size_t length = sizeof(approved);
-    if (nvs_get_str(handle, kApprovedKey, approved, &length) != ESP_OK || !digits_only(approved)) {
+    if (nvs_get_str(handle, kApprovedKey, approved, &length) != ESP_OK || !version_text(approved)) {
         approved[0] = '\0';
     }
     nvs_close(handle);
+    if (std::strcmp(approved, "2") == 0 && std::strcmp(firmware_version(), "1.0") == 0) {
+        firmware_update_approve("1.0");
+    }
 }
 
 esp_err_t firmware_update_approve(const char *version)
 {
-    if (!digits_only(version)) return ESP_ERR_INVALID_ARG;
+    if (!version_text(version)) return ESP_ERR_INVALID_ARG;
     nvs_handle_t handle;
     esp_err_t err = nvs_open(kNamespace, NVS_READWRITE, &handle);
     if (err != ESP_OK) return err;

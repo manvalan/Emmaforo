@@ -1,6 +1,9 @@
 #include "bq25896.h"
 
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+
+static const char *TAG = "BQ25896";
 
 namespace {
 constexpr uint8_t kRegInputSource = 0x00;
@@ -95,8 +98,37 @@ esp_err_t BQ::BQ_set_charge_current_ma(uint16_t milliamps)
     if (milliamps > 5056) {
         return ESP_ERR_INVALID_ARG;
     }
-    return BQ_update_register(kRegChargeCurrent, kChargeCurrentMask,
-                              static_cast<uint8_t>(milliamps / 64));
+    const uint16_t requested = static_cast<uint16_t>((milliamps / 64) * 64);
+    const esp_err_t wrote = BQ_update_register(kRegChargeCurrent, kChargeCurrentMask,
+                                               static_cast<uint8_t>(milliamps / 64));
+    if (wrote != ESP_OK) {
+        ESP_LOGW(TAG, "Charge current register was not written");
+        return wrote;
+    }
+    uint16_t read_ma = 0;
+    const esp_err_t read = BQ_get_charge_current_setting_ma(&read_ma);
+    if (read != ESP_OK) {
+        ESP_LOGW(TAG, "Charge current register was not read back");
+        return read;
+    }
+    ESP_LOGI(TAG, "Charge current register REG04 is %u mA", read_ma);
+    if (read_ma != requested) {
+        ESP_LOGW(TAG, "Charge current register does not match %u mA", requested);
+    }
+    return ESP_OK;
+}
+
+esp_err_t BQ::BQ_get_charge_current_setting_ma(uint16_t *milliamps) const
+{
+    if (milliamps == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t value = 0;
+    const esp_err_t ret = BQ_read_register(kRegChargeCurrent, &value);
+    if (ret == ESP_OK) {
+        *milliamps = static_cast<uint16_t>((value & kChargeCurrentMask) * 64);
+    }
+    return ret;
 }
 
 esp_err_t BQ::BQ_set_charge_voltage_mv(uint16_t millivolts)
