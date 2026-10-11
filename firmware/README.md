@@ -4,15 +4,15 @@ Firmware ESP-IDF della scheda, progetto `emmaforo`, target `esp32c6` come in `sd
 
 ## Collegamenti
 
-Il Bluetooth LE è il collegamento normale. Il Wi‑Fi è spento per default: si accende per il controllo remoto se l'utente lo attiva (vedi sotto), oppure quando l'utente ha approvato un firmware nuovo e in memoria c'è una rete; in quel caso resta acceso il tempo del download e poi si spegne. Se la rete non si raggiunge entro cinque minuti, o il download fallisce cinque volte con attese crescenti, l'approvazione viene annullata e il Wi‑Fi si spegne; l'utente può approvare di nuovo dall'app.
+Il Bluetooth LE è il collegamento normale. Il Wi‑Fi serve solo a scaricare un firmware nuovo: si accende quando l'app lo segnala, l'utente lo approva e in memoria c'è una rete; in quel caso resta acceso il tempo del download e poi si spegne. Se la rete non si raggiunge entro cinque minuti, o il download fallisce cinque volte con attese crescenti, l'approvazione viene annullata e il Wi‑Fi si spegne; l'utente può approvare di nuovo dall'app.
 
 Un firmware nuovo sta in https://emmaforo.michelebigi.it/firmware/ insieme a una nota di versione. La scheda lo scarica solo se quella versione è stata confermata, solo da quella cartella, e solo sulla rete già salvata. Poi si riavvia. Se la nuova immagine non parte, il bootloader torna a quella precedente. Nome, colori e rete salvata non vengono cancellati.
 
 Il comando della lampada è `destinazione,colore,lampeggio,intervallo,livello`. Il colore può essere `rosso`, `giallo`, `verde`, `spento` oppure `#RRGGBB`. Un colore non riconosciuto non cambia la luce. Rete, nome e colori stanno nella NVS tramite `SettingsStore`.
 
-## Controllo remoto (opzionale, spento per default)
+## Controllo remoto (escluso dal firmware per ora)
 
-Si attiva dall'app (caratteristica `FFEC`) e usa la rete Wi‑Fi salvata. La scheda sceglie da sola come usare la radio:
+Compilato solo con `CONFIG_EMMAFORO_REMOTE` (spento per default): senza, la caratteristica `FFEC` non esiste e il Wi‑Fi resta solo per gli aggiornamenti. Con l'opzione attiva si accende dall'app (caratteristica `FFEC`) e usa la rete Wi‑Fi salvata. La scheda sceglie da sola come usare la radio:
 
 - **Sul caricatore USB** resta associata e collegata al broker: i comandi arrivano subito.
 - **A batteria con un router Wi‑Fi 6 che concede il TWT individuale** resta associata ma la radio dorme tra un periodo di servizio e l'altro (10 s per default, `CONFIG_EMMAFORO_REMOTE_TWT_INTERVAL_S`): i comandi arrivano in pochi secondi.

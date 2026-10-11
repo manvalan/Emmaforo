@@ -1,5 +1,9 @@
 #include "remote_crypto.h"
 
+#include "sdkconfig.h"
+
+#if CONFIG_EMMAFORO_REMOTE
+
 #include <cstring>
 
 #include "esp_random.h"
@@ -83,3 +87,5 @@ bool parse_hex_key(const char *hex, uint8_t out[kKeySize])
 }
 
 }
+
+#endif

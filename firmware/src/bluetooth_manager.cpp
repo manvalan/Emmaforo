@@ -6,6 +6,7 @@
 #include <cstdlib>
 
 #include "battery_log.h"
+#include "sdkconfig.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -633,11 +634,13 @@ const ble_gatt_svc_def services[] = {
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &battery_log_handle,
             },
+#if CONFIG_EMMAFORO_REMOTE
             {
                 .uuid = &kRemoteUuid.u,
                 .access_cb = gatt_access,
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
             },
+#endif
             {},
         },
     },

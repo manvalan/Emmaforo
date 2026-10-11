@@ -1,5 +1,9 @@
 #include "remote_link.h"
 
+#include "sdkconfig.h"
+
+#if CONFIG_EMMAFORO_REMOTE
+
 #include "remote_crypto.h"
 
 #include <cstdio>
@@ -558,3 +562,19 @@ void RemoteLink::mqtt_event(void *arg, esp_event_base_t, int32_t id, void *data)
     }
     wake_app();
 }
+
+#else
+
+// Remote control is compiled out: Wi-Fi is only for approved firmware updates.
+void RemoteLink::begin() {}
+bool RemoteLink::apply_command(const char *) { return false; }
+void RemoteLink::poll(bool, bool, int64_t) {}
+uint32_t RemoteLink::next_wake_ms(int64_t) const { return UINT32_MAX; }
+bool RemoteLink::take_command(char *, size_t) { return false; }
+void RemoteLink::publish_state(const char *) {}
+void RemoteLink::status_text(char *out, size_t size) const
+{
+    if (out != nullptr && size > 0) out[0] = '\0';
+}
+
+#endif
