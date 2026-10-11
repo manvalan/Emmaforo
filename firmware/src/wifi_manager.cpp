@@ -217,6 +217,12 @@ esp_err_t WifiManager::begin_sta(const char *ssid, const char *password)
     if (ret != ESP_OK) {
         return ret;
     }
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    // Wi-Fi 6 at 20 MHz is what individual TWT needs (remote control on battery).
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N |
+                                       WIFI_PROTOCOL_11AX);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+#endif
 
     ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
     if (ret != ESP_OK) {

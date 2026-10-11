@@ -34,6 +34,9 @@ public:
     bool take_color_preset(uint8_t *data, size_t size);
     bool take_credentials(char *ssid, size_t ssid_size, char *password, size_t password_size);
     bool take_firmware_approval(char *version, size_t version_size);
+    // FFEC: remote control settings ("on", "off", "interval:N", "broker:", "user:", "pass:").
+    bool take_remote_command(char *command, size_t command_size);
+    void set_remote_status(const char *status);
 
 private:
     bool initialized_;

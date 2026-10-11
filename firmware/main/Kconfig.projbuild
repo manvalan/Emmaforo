@@ -23,4 +23,19 @@ menu "Emmaforo"
         help
             3072 samples at 120 s cover a little over four days.
 
+    config EMMAFORO_REMOTE_BROKER
+        string "MQTT broker for remote control"
+        default "mqtts://emmaforo.michelebigi.it:8883"
+        help
+            Used only when the user turns remote control on. The app can store
+            a different broker and credentials over Bluetooth.
+
+    config EMMAFORO_REMOTE_TWT_INTERVAL_S
+        int "TWT wake interval in seconds"
+        range 1 60
+        default 10
+        help
+            On battery with a Wi-Fi 6 router, the radio wakes this often to
+            receive commands. Longer saves battery, shorter answers sooner.
+
 endmenu

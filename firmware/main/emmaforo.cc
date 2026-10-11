@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include "driver/i2c_master.h"
 #include "bq25896.h"
 #include "esp_err.h"
@@ -18,6 +19,7 @@
 #include "bluetooth_manager.h"
 #include "firmware_update.h"
 #include "max17048.h"
+#include "remote_link.h"
 #include "serial_rgb_led.h"
 #include "settings_store.h"
 #include "setup_portal.h"
@@ -417,6 +419,12 @@ extern "C" void app_main(void)
     bluetooth.set_network_status(network_settings.ssid, false, "", network_settings.password[0] != '\0');
     if (ret == ESP_OK) firmware_update_mark_valid();
 
+    char device_id[13] = {};
+    std::snprintf(device_id, sizeof(device_id), "%02X%02X%02X%02X%02X%02X", factory_mac[0], factory_mac[1],
+                  factory_mac[2], factory_mac[3], factory_mac[4], factory_mac[5]);
+    RemoteLink remote;
+    remote.begin(device_id);
+
     SerialRgbLed::Color led_color = {0, 0, 0};
     bool led_blink = false;
     bool led_on = false;
@@ -502,6 +510,35 @@ extern "C" void app_main(void)
             configuration_led_mode = requested_configuration_mode;
         }
 
+        char remote_setting[200] = {};
+        if (bluetooth.take_remote_command(remote_setting, sizeof(remote_setting)) &&
+            !remote.apply_command(remote_setting)) {
+            ESP_LOGW(TAG, "Remote setting not understood");
+        }
+        // Commands from the broker use the same text as the Bluetooth ones.
+        bool remote_pause_set = false;
+        bool remote_pause = false;
+        bool remote_gentle_set = false;
+        bool remote_gentle = false;
+        bool remote_rest = false;
+        char remote_led[32] = {};
+        char remote_command[64] = {};
+        while (remote.take_command(remote_command, sizeof(remote_command))) {
+            ESP_LOGI(TAG, "Remote command: %s", remote_command);
+            if (std::strcmp(remote_command, "pause:1") == 0 || std::strcmp(remote_command, "pause:0") == 0) {
+                remote_pause_set = true;
+                remote_pause = remote_command[6] == '1';
+            } else if (std::strcmp(remote_command, "gentle:1") == 0 || std::strcmp(remote_command, "gentle:0") == 0) {
+                remote_gentle_set = true;
+                remote_gentle = remote_command[7] == '1';
+            } else if (std::strcmp(remote_command, "riposo") == 0) {
+                remote_rest = true;
+            } else if (remote_command[0] >= '0' && remote_command[0] <= '9' &&
+                       std::strlen(remote_command) < sizeof(remote_led)) {
+                std::memcpy(remote_led, remote_command, std::strlen(remote_command) + 1);
+            }
+        }
+
         bool pause_changed = false;
         bool pause_value = false;
         if (portal.take_charging_command(&pause_value)) {
@@ -512,6 +549,10 @@ extern "C" void app_main(void)
         if (bluetooth.take_charge_pause(&ble_pause)) {
             pause_changed = true;
             user_charge_paused = ble_pause;
+        }
+        if (remote_pause_set) {
+            pause_changed = true;
+            user_charge_paused = remote_pause;
         }
         if (pause_changed) {
             network_settings.charge_paused = user_charge_paused ? 1 : 0;
@@ -524,6 +565,10 @@ extern "C" void app_main(void)
         bool gentle_charge = network_settings.gentle_charge != 0;
         bool current_changed = false;
         if (bluetooth.take_gentle_charge(&gentle_charge)) current_changed = true;
+        if (remote_gentle_set) {
+            gentle_charge = remote_gentle;
+            current_changed = true;
+        }
         bool http_gentle = false;
         if (portal.take_charge_current(&http_gentle)) {
             gentle_charge = http_gentle;
@@ -546,7 +591,7 @@ extern "C" void app_main(void)
             }
         }
 
-        if (portal.take_shutdown_command() || bluetooth.take_shutdown()) {
+        if (portal.take_shutdown_command() || bluetooth.take_shutdown() || remote_rest) {
             resting = true;
             led_on = false;
             led_blink = false;
@@ -587,7 +632,12 @@ extern "C" void app_main(void)
         }
 
         char ble_led_command[32] = {};
-        if (bluetooth.take_led_command(ble_led_command, sizeof(ble_led_command))) {
+        bool lamp_command = bluetooth.take_led_command(ble_led_command, sizeof(ble_led_command));
+        if (!lamp_command && remote_led[0] != '\0') {
+            std::snprintf(ble_led_command, sizeof(ble_led_command), "%s", remote_led);
+            lamp_command = true;
+        }
+        if (lamp_command) {
             resting = false;
             char fields[5][16] = {};
             int field_count = 0;
@@ -630,7 +680,13 @@ extern "C" void app_main(void)
         // Wi-Fi is off by default. It joins the stored network only to fetch a
         // firmware the user approved, and only for as long as that takes.
         const bool update_wanted = firmware_update_pending();
-        const bool want_wifi = !resting && network_settings.ssid[0] != '\0' && update_wanted;
+        // Remote control (off unless the user turned it on) decides by itself
+        // between staying associated on USB, TWT on a Wi-Fi 6 router, or
+        // short check-ins. It keeps working while resting so the lamp can be
+        // woken from afar.
+        remote.poll(have_status && status.power_good, wifi_on && wifi.is_connected(), now_us);
+        const bool want_wifi = network_settings.ssid[0] != '\0' &&
+                               ((update_wanted && !resting) || remote.wants_wifi());
         if (ble_held) {
             if (!logged_ble_hold) {
                 ESP_LOGI(TAG, "Bluetooth session held");
@@ -662,7 +718,7 @@ extern "C" void app_main(void)
             wifi.stop();
             wifi_on = false;
             sta_join_started = false;
-            ESP_LOGI(TAG, "No firmware to fetch: Wi-Fi off");
+            ESP_LOGI(TAG, "Nothing needs Wi-Fi: Wi-Fi off");
         }
         const bool wifi_connected = wifi_on && wifi.is_connected();
         firmware_update_poll(wifi_connected);
@@ -752,6 +808,22 @@ extern "C" void app_main(void)
         log_context.resting = resting;
         battery_log::record(status, log_context);
 
+        if (remote.enabled()) {
+            char state_json[192] = {};
+            std::snprintf(state_json, sizeof(state_json),
+                          "{\"pct\":%u,\"valid\":%u,\"charging\":%u,\"usb\":%u,\"on\":%u,"
+                          "\"color\":\"#%02X%02X%02X\",\"blink\":%u,\"level\":%u,\"rest\":%u,"
+                          "\"mode\":%u,\"interval\":%u,\"fw\":\"%s\"}",
+                          shown, status.valid ? 1 : 0, status.charging ? 1 : 0, status.power_good ? 1 : 0,
+                          led_on ? 1 : 0, led_color.r, led_color.g, led_color.b, led_blink ? 1 : 0, led_level,
+                          resting ? 1 : 0, static_cast<unsigned>(remote.mode()), remote.interval_minutes(),
+                          firmware_version());
+            remote.publish_state(state_json);
+        }
+        char remote_status_text[96] = {};
+        remote.status_text(remote_status_text, sizeof(remote_status_text));
+        bluetooth.set_remote_status(remote_status_text);
+
         // Everything published uses the shown scale: the 95% point reads 100%.
         g_published_battery.percentage = shown;
         g_published_battery.voltage_mv = status.voltage_mv;
@@ -805,17 +877,22 @@ extern "C" void app_main(void)
             if (charger_ready && charger.BQ_disable_watchdog() != ESP_OK) {
                 ESP_LOGW(TAG, "Charger watchdog stayed armed during light sleep");
             }
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kRestLoopMs));
+            uint32_t rest_delay_ms = kRestLoopMs;
+            if (remote.session_active() || (remote.wants_wifi() && !wifi.is_connected())) rest_delay_ms = 1000;
+            rest_delay_ms = std::min(rest_delay_ms, remote.next_wake_ms(esp_timer_get_time()));
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(rest_delay_ms));
         } else {
             if (charger_ready && charger.BQ_pet_watchdog() != ESP_OK) {
                 ESP_LOGW(TAG, "Charger watchdog was not reset");
             }
             uint32_t loop_delay_ms = I2C_SCAN_PERIOD_MS;
-            if (want_wifi || firmware_update_busy()) {
+            if ((want_wifi && !wifi.is_connected()) || update_wanted || firmware_update_busy()) {
                 loop_delay_ms = 1000;
             } else if (led_on && led_blink && led_blink_interval_ms < I2C_SCAN_PERIOD_MS) {
                 loop_delay_ms = led_blink_interval_ms;
             }
+            if (remote.session_active()) loop_delay_ms = std::min<uint32_t>(loop_delay_ms, 1000);
+            loop_delay_ms = std::min(loop_delay_ms, remote.next_wake_ms(esp_timer_get_time()));
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(loop_delay_ms));
         }
     }

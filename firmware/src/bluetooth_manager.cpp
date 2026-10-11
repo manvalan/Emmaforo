@@ -107,6 +107,10 @@ const ble_uuid16_t kFirmwareVersionUuid = BLE_UUID16_INIT(0xFFEF);
 const ble_uuid16_t kFirmwareApproveUuid = BLE_UUID16_INIT(0xFFEE);
 // Added after app 1.0: older apps never discover it.
 const ble_uuid16_t kBatteryLogUuid = BLE_UUID16_INIT(0xFFED);
+const ble_uuid16_t kRemoteUuid = BLE_UUID16_INIT(0xFFEC);
+char pending_remote_command[200] = {};
+bool remote_command_requested = false;
+char remote_status[96] = {};
 
 // Fields 0-9 are what app 1.0 parses. Fields 10-12 were added later and are
 // ignored by it: gauge present, rate in 0.1 %/h, gauge alert flags.
@@ -248,6 +252,25 @@ int gatt_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_acce
 {
     if (ctxt == nullptr) {
         return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    if (ctxt->chr != nullptr && ble_uuid_cmp(ctxt->chr->uuid, &kRemoteUuid.u) == 0) {
+        if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+            const size_t length = std::strlen(remote_status);
+            if (ctxt->offset > length) return BLE_ATT_ERR_INVALID_OFFSET;
+            return os_mbuf_append(ctxt->om, remote_status + ctxt->offset, length - ctxt->offset) == 0
+                ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+        const uint16_t length = OS_MBUF_PKTLEN(ctxt->om);
+        if (length == 0 || length >= sizeof(pending_remote_command) || remote_command_requested ||
+            ble_hs_mbuf_to_flat(ctxt->om, pending_remote_command, length, nullptr) != 0) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        pending_remote_command[length] = '\0';
+        remote_command_requested = true;
+        wake_app_task();
+        return 0;
     }
 
     if (ctxt->chr != nullptr && ble_uuid_cmp(ctxt->chr->uuid, &kBatteryLogUuid.u) == 0) {
@@ -610,6 +633,11 @@ const ble_gatt_svc_def services[] = {
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &battery_log_handle,
             },
+            {
+                .uuid = &kRemoteUuid.u,
+                .access_cb = gatt_access,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+            },
             {},
         },
     },
@@ -923,4 +951,16 @@ bool BluetoothManager::take_firmware_approval(char *version, size_t version_size
     std::snprintf(version, version_size, "%s", pending_firmware_version);
     firmware_approval_requested = false;
     return true;
+}
+bool BluetoothManager::take_remote_command(char *command, size_t command_size)
+{
+    if (!remote_command_requested || command == nullptr || command_size == 0) return false;
+    std::snprintf(command, command_size, "%s", pending_remote_command);
+    remote_command_requested = false;
+    return true;
+}
+
+void BluetoothManager::set_remote_status(const char *status)
+{
+    std::snprintf(remote_status, sizeof(remote_status), "%s", status == nullptr ? "" : status);
 }

@@ -57,7 +57,11 @@ L'app ha già gli App Intents, quindi Siri e Comandi Rapidi funzionano oggi via 
 - **Sviluppo e uso personale.** Il prototipo con le credenziali di test non pone problemi.
 - **Strada B** (ponte Home Assistant via BLE) non usa né Matter né Thread nella lampada: nessun vincolo.
 
-## Proposta senza licenze commerciali (scelta)
+## Scelta finale (11 ottobre 2026)
+
+Solo l'hardware attuale, nessuna licenza a pagamento: Wi‑Fi sotto USB, TWT con i router Wi‑Fi 6, controllo a intervalli con gli altri. Attivabile dall'utente, spento per default. Implementato nel firmware (`remote_link`), vedi il README. Restano da fare il server (broker MQTT con login) e le integrazioni Alexa Smart Home e Google Home cloud-to-cloud.
+
+## Proposta senza licenze commerciali (superata dalla scelta finale)
 
 Michele ha chiesto una strada semplice che non richieda adesioni o certificazioni a pagamento. Matter e Thread restano fuori dalla lampada.
 

@@ -4,11 +4,28 @@ Firmware ESP-IDF della scheda, progetto `emmaforo`, target `esp32c6` come in `sd
 
 ## Collegamenti
 
-Il Bluetooth LE è l'unico collegamento normale. Il Wi‑Fi è spento per default: si accende solo quando l'utente ha approvato un firmware nuovo e in memoria c'è una rete, resta acceso il tempo del download e poi si spegne. Se la rete non si raggiunge entro cinque minuti, o il download fallisce cinque volte con attese crescenti, l'approvazione viene annullata e il Wi‑Fi si spegne; l'utente può approvare di nuovo dall'app.
+Il Bluetooth LE è il collegamento normale. Il Wi‑Fi è spento per default: si accende per il controllo remoto se l'utente lo attiva (vedi sotto), oppure quando l'utente ha approvato un firmware nuovo e in memoria c'è una rete; in quel caso resta acceso il tempo del download e poi si spegne. Se la rete non si raggiunge entro cinque minuti, o il download fallisce cinque volte con attese crescenti, l'approvazione viene annullata e il Wi‑Fi si spegne; l'utente può approvare di nuovo dall'app.
 
 Un firmware nuovo sta in https://emmaforo.michelebigi.it/firmware/ insieme a una nota di versione. La scheda lo scarica solo se quella versione è stata confermata, solo da quella cartella, e solo sulla rete già salvata. Poi si riavvia. Se la nuova immagine non parte, il bootloader torna a quella precedente. Nome, colori e rete salvata non vengono cancellati.
 
 Il comando della lampada è `destinazione,colore,lampeggio,intervallo,livello`. Il colore può essere `rosso`, `giallo`, `verde`, `spento` oppure `#RRGGBB`. Un colore non riconosciuto non cambia la luce. Rete, nome e colori stanno nella NVS tramite `SettingsStore`.
+
+## Controllo remoto (opzionale, spento per default)
+
+Si attiva dall'app (caratteristica `FFEC`) e usa la rete Wi‑Fi salvata. La scheda sceglie da sola come usare la radio:
+
+- **Sul caricatore USB** resta associata e collegata al broker: i comandi arrivano subito.
+- **A batteria con un router Wi‑Fi 6 che concede il TWT individuale** resta associata ma la radio dorme tra un periodo di servizio e l'altro (10 s per default, `CONFIG_EMMAFORO_REMOTE_TWT_INTERVAL_S`): i comandi arrivano in pochi secondi.
+- **A batteria con qualsiasi altro router** si collega ogni N minuti (1–60, default 10), ritira i comandi in coda e spegne il Wi‑Fi.
+
+Il router viene provato la prima volta che la scheda lo raggiunge a batteria. Il risultato resta in NVS insieme al BSSID, quindi un router diverso viene provato di nuovo. Se un router TWT non si raggiunge per 30 s, la scheda riprova dopo un intervallo invece di insistere.
+
+Il collegamento passa da un broker MQTT (`CONFIG_EMMAFORO_REMOTE_BROKER`, default `mqtts://emmaforo.michelebigi.it:8883`) con sessione persistente, così i comandi QoS 1 inviati mentre la scheda dorme arrivano al controllo successivo:
+
+- `emmaforo/<MAC>/cmd`: comandi con lo stesso testo del Bluetooth, cioè `destinazione,colore,lampeggio,intervallo,livello`, `pause:0|1`, `gentle:0|1`, `riposo`
+- `emmaforo/<MAC>/state` (retained): JSON con percentuale mostrata, carica, USB, lampada, riposo, modo (0 spento, 1 USB, 2 TWT, 3 intervalli), intervallo e firmware
+
+`FFEC` in scrittura accetta `on`, `off`, `interval:<minuti>`, `broker:<uri>`, `user:<nome>`, `pass:<segreto>`; in lettura restituisce `1\tattivo\tminuti\tmodo\trouter\tbroker`, con router 0 non provato, 1 senza TWT, 2 con TWT.
 
 ## Batteria
 
