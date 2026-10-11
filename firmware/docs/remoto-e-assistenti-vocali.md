@@ -57,7 +57,20 @@ L'app ha già gli App Intents, quindi Siri e Comandi Rapidi funzionano oggi via 
 - **Sviluppo e uso personale.** Il prototipo con le credenziali di test non pone problemi.
 - **Strada B** (ponte Home Assistant via BLE) non usa né Matter né Thread nella lampada: nessun vincolo.
 
-## Proposta
+## Proposta senza licenze commerciali (scelta)
+
+Michele ha chiesto una strada semplice che non richieda adesioni o certificazioni a pagamento. Matter e Thread restano fuori dalla lampada.
+
+1. **Siri, subito.** Gli App Intents dell'app funzionano già via BLE quando il telefono è vicino. Nessun vincolo.
+2. **Emmaforo Bridge.** Un ESP32 sempre alimentato via USB (anche una scheda Emmaforo senza batteria, con un firmware "ponte") parla BLE con le lampade di casa, usando lo stesso servizio `FFF0`, e si collega in uscita al server `emmaforo.michelebigi.it`. La lampada resta solo BLE e la batteria non cambia.
+3. **Alexa e Google dal server.** Una skill Alexa Smart Home e un'integrazione Google Home cloud-to-cloud chiamano il server, che inoltra il comando al ponte. I programmi sviluppatori di Amazon e Google sono gratuiti, senza royalty; la revisione della skill è gratuita. Il bollino "Works with Alexa/Google" è facoltativo. Serve solo rispettare le linee guida sui marchi quando si scrive "funziona con Alexa".
+4. **Da remoto.** L'app usa lo stesso server quando la lampada è fuori portata BLE, al posto del vecchio ripiego Wi-Fi.
+5. **Home Assistant**, per chi lo usa: un'integrazione open source che parla `FFF0` via BLE. Facoltativa.
+
+Cosa serve costruire: firmware del ponte (BLE centrale + Wi-Fi + MQTT/HTTPS verso il server), un piccolo server con login OAuth per il collegamento account di Alexa e Google, la skill Alexa e il progetto Google Home. Costo ricorrente: solo l'hosting.
+
+## Proposta precedente (Matter, solo come riferimento)
+
 
 1. **Misurare il consumo attuale** con il registro batteria (scheda di test, build Debug dell'app): BLE inattivo, riposo, lampada accesa a vari livelli, con e senza MAX17048G.
 2. **Prototipo Matter su Thread** su una scheda flashata via USB partendo dall'esempio *light* di esp‑matter per ESP32‑C6: dimensione dell'immagine contro 1,875 MB, abbinamento via BLE con Alexa, Google e Apple Casa, consumo con due o tre intervalli ICD.
