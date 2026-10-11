@@ -50,6 +50,13 @@ Skill Smart Home e integrazione cloud‑to‑cloud su un server nostro.
 
 L'app ha già gli App Intents, quindi Siri e Comandi Rapidi funzionano oggi via BLE quando il telefono è vicino. Alexa e Google non possono avviare azioni di un'app iOS, e da fuori casa il telefono non raggiunge la lampada. Utile, ma non risolve il "da remoto".
 
+## Licenze (non è un parere legale)
+
+- **Codice.** connectedhomeip ed esp-matter sono Apache 2.0, OpenThread è BSD-3, ESP-IDF è Apache 2.0. Usare e modificare il codice non viola nessuna licenza, basta conservare gli avvisi di copyright.
+- **Nomi, loghi e brevetti.** "Matter" e "Thread" sono marchi. Per scriverli sulla scatola o nell'app, o per usare i loghi, il prodotto va certificato: Matter con la CSA, Thread con il Thread Group (la certificazione Matter su Thread richiede anche quella Thread). La licenza sui brevetti della specifica vale tra i membri della CSA. Quindi per **vendere** un prodotto Matter la strada pulita è aderire alla CSA e certificare.
+- **Sviluppo e uso personale.** Il prototipo con le credenziali di test non pone problemi.
+- **Strada B** (ponte Home Assistant via BLE) non usa né Matter né Thread nella lampada: nessun vincolo.
+
 ## Proposta
 
 1. **Misurare il consumo attuale** con il registro batteria (scheda di test, build Debug dell'app): BLE inattivo, riposo, lampada accesa a vari livelli, con e senza MAX17048G.
