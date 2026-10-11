@@ -1,5 +1,7 @@
 #include "remote_link.h"
 
+#include "remote_crypto.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +27,8 @@ constexpr char kUserKey[] = "rl_user";
 constexpr char kPassKey[] = "rl_pass";
 constexpr char kRouterKey[] = "rl_router";
 constexpr char kBssidKey[] = "rl_bssid";
+constexpr char kKeyKey[] = "rl_key";
+constexpr char kSequenceKey[] = "rl_seq";
 
 // A check-in ends once the queued commands had time to arrive, or after a
 // hard limit when the router or the broker cannot be reached.
@@ -69,13 +73,11 @@ void twt_interval_fields(uint32_t seconds, uint16_t *mantissa, uint8_t *exponent
 }
 }
 
-void RemoteLink::begin(const char *device_id)
+void RemoteLink::begin()
 {
     app_task = xTaskGetCurrentTaskHandle();
-    std::snprintf(device_id_, sizeof(device_id_), "%s", device_id == nullptr ? "" : device_id);
-    std::snprintf(cmd_topic_, sizeof(cmd_topic_), "emmaforo/%s/cmd", device_id_);
-    std::snprintf(state_topic_, sizeof(state_topic_), "emmaforo/%s/state", device_id_);
     load();
+    derive_keys();
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_ITWT_SETUP, &RemoteLink::wifi_event, this);
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_ITWT_TEARDOWN, &RemoteLink::wifi_event, this);
     ESP_LOGI(kTag, "Remote control %s, check-in every %u min, router %s",
@@ -108,6 +110,36 @@ void RemoteLink::load()
     }
     length = sizeof(router_bssid_);
     if (nvs_get_blob(handle, kBssidKey, router_bssid_, &length) != ESP_OK) router_ = Router::Unknown;
+    length = sizeof(key_);
+    has_key_ = nvs_get_blob(handle, kKeyKey, key_, &length) == ESP_OK && length == sizeof(key_);
+    uint64_t sequence = 0;
+    if (nvs_get_u64(handle, kSequenceKey, &sequence) == ESP_OK) last_sequence_ = sequence;
+    nvs_close(handle);
+    if (!has_key_) enabled_ = false;
+}
+
+void RemoteLink::derive_keys()
+{
+    topic_id_[0] = '\0';
+    cmd_topic_[0] = '\0';
+    state_topic_[0] = '\0';
+    if (!has_key_) return;
+    uint8_t topic[32] = {};
+    remote_crypto::derive(key_, remote_crypto::kTopicLabel, topic);
+    remote_crypto::derive(key_, remote_crypto::kCommandLabel, command_key_);
+    remote_crypto::derive(key_, remote_crypto::kStateLabel, state_key_);
+    for (int index = 0; index < 16; ++index) std::snprintf(topic_id_ + index * 2, 3, "%02x", topic[index]);
+    std::snprintf(cmd_topic_, sizeof(cmd_topic_), "emmaforo/%s/cmd", topic_id_);
+    std::snprintf(state_topic_, sizeof(state_topic_), "emmaforo/%s/state", topic_id_);
+    // A random-looking client id from the same key: no MAC, no serial.
+    std::snprintf(client_id_, sizeof(client_id_), "b%.16s", topic_id_ + 16);
+}
+
+void RemoteLink::save_sequence(uint64_t sequence) const
+{
+    nvs_handle_t handle;
+    if (nvs_open(kNamespace, NVS_READWRITE, &handle) != ESP_OK) return;
+    if (nvs_set_u64(handle, kSequenceKey, sequence) == ESP_OK) nvs_commit(handle);
     nvs_close(handle);
 }
 
@@ -121,6 +153,15 @@ esp_err_t RemoteLink::save() const
     if (ret == ESP_OK) ret = nvs_set_str(handle, kBrokerKey, broker_);
     if (ret == ESP_OK) ret = nvs_set_str(handle, kUserKey, user_);
     if (ret == ESP_OK) ret = nvs_set_str(handle, kPassKey, pass_);
+    if (ret == ESP_OK) {
+        if (has_key_) {
+            ret = nvs_set_blob(handle, kKeyKey, key_, sizeof(key_));
+        } else {
+            const esp_err_t erased = nvs_erase_key(handle, kKeyKey);
+            ret = erased == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : erased;
+        }
+    }
+    if (ret == ESP_OK) ret = nvs_set_u64(handle, kSequenceKey, last_sequence_);
     if (ret == ESP_OK) ret = nvs_commit(handle);
     nvs_close(handle);
     return ret;
@@ -141,7 +182,23 @@ bool RemoteLink::apply_command(const char *command)
 {
     if (command == nullptr) return false;
     bool restart_mqtt = false;
-    if (std::strcmp(command, "on") == 0) {
+    if (std::strncmp(command, "key:", 4) == 0) {
+        uint8_t key[sizeof(key_)] = {};
+        if (!remote_crypto::parse_hex_key(command + 4, key)) return false;
+        std::memcpy(key_, key, sizeof(key_));
+        has_key_ = true;
+        last_sequence_ = 0;
+        derive_keys();
+        restart_mqtt = true;
+    } else if (std::strcmp(command, "forget") == 0) {
+        std::memset(key_, 0, sizeof(key_));
+        has_key_ = false;
+        enabled_ = false;
+        last_sequence_ = 0;
+        derive_keys();
+        restart_mqtt = true;
+    } else if (std::strcmp(command, "on") == 0) {
+        if (!has_key_) return false;
         enabled_ = true;
         next_checkin_us_ = 0;
     } else if (std::strcmp(command, "off") == 0) {
@@ -177,7 +234,7 @@ bool RemoteLink::apply_command(const char *command)
 
 void RemoteLink::poll(bool power_good, bool wifi_connected, int64_t now_us)
 {
-    if (!enabled_ || broker_[0] == '\0') {
+    if (!enabled_ || !has_key_ || broker_[0] == '\0') {
         if (mqtt_started_) stop_mqtt();
         if (twt_active_) teardown_twt();
         mode_ = Mode::Off;
@@ -338,9 +395,7 @@ void RemoteLink::start_mqtt()
         if (std::strncmp(broker_, "mqtts://", 8) == 0) {
             config.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
         }
-        static char client_id[32] = {};
-        std::snprintf(client_id, sizeof(client_id), "emmaforo-%s", device_id_);
-        config.credentials.client_id = client_id;
+        config.credentials.client_id = client_id_;
         if (user_[0] != '\0') config.credentials.username = user_;
         if (pass_[0] != '\0') config.credentials.authentication.password = pass_;
         // Persistent session: QoS 1 commands wait at the broker while the board is away.
@@ -410,17 +465,23 @@ void RemoteLink::publish_state(const char *json)
         std::snprintf(state_, sizeof(state_), "%s", json);
         state_dirty_ = true;
     }
-    if (state_dirty_ && mqtt_connected_ && mqtt_ != nullptr) {
-        if (esp_mqtt_client_publish(mqtt_, state_topic_, state_, 0, 1, 1) >= 0) state_dirty_ = false;
+    if (state_dirty_ && mqtt_connected_ && mqtt_ != nullptr && has_key_) {
+        uint8_t sealed[sizeof(state_) + remote_crypto::kOverhead + 8] = {};
+        const uint64_t sequence = static_cast<uint64_t>(esp_timer_get_time() / 1000);
+        const size_t length = remote_crypto::seal(state_key_, sequence, state_, sealed, sizeof(sealed));
+        if (length > 0 && esp_mqtt_client_publish(mqtt_, state_topic_, reinterpret_cast<const char *>(sealed),
+                                                  static_cast<int>(length), 1, 1) >= 0) {
+            state_dirty_ = false;
+        }
     }
 }
 
 void RemoteLink::status_text(char *out, size_t size) const
 {
     if (out == nullptr || size == 0) return;
-    // format, enabled, interval min, mode, router (0 unknown, 1 no TWT, 2 TWT), broker connected
-    std::snprintf(out, size, "1\t%u\t%u\t%s\t%u\t%u", enabled_ ? 1 : 0, interval_minutes_, mode_name(mode_),
-                  static_cast<unsigned>(router_), mqtt_connected_ ? 1 : 0);
+    // format, enabled, interval min, mode, router (0 unknown, 1 no TWT, 2 TWT), broker connected, key stored
+    std::snprintf(out, size, "1\t%u\t%u\t%s\t%u\t%u\t%u", enabled_ ? 1 : 0, interval_minutes_, mode_name(mode_),
+                  static_cast<unsigned>(router_), mqtt_connected_ ? 1 : 0, has_key_ ? 1 : 0);
 }
 
 void RemoteLink::wifi_event(void *arg, esp_event_base_t, int32_t id, void *data)
@@ -466,12 +527,23 @@ void RemoteLink::mqtt_event(void *arg, esp_event_base_t, int32_t id, void *data)
     case MQTT_EVENT_DATA:
         if (event->topic_len == static_cast<int>(std::strlen(self->cmd_topic_)) &&
             std::strncmp(event->topic, self->cmd_topic_, event->topic_len) == 0 &&
-            event->data_len > 0 && event->data_len < static_cast<int>(kCommandSize) &&
-            event->current_data_offset == 0 && event->total_data_len == event->data_len) {
+            event->data_len > 0 && event->current_data_offset == 0 && event->total_data_len == event->data_len) {
+            char text[kCommandSize] = {};
+            uint64_t sequence = 0;
+            if (!remote_crypto::open(self->command_key_, reinterpret_cast<const uint8_t *>(event->data),
+                                     static_cast<size_t>(event->data_len), &sequence, text, sizeof(text))) {
+                ESP_LOGW(kTag, "Command dropped: not sealed with this lamp's key");
+                break;
+            }
+            if (sequence <= self->last_sequence_) {
+                ESP_LOGW(kTag, "Command dropped: replayed or out of order");
+                break;
+            }
+            self->last_sequence_ = sequence;
+            self->save_sequence(sequence);
             taskENTER_CRITICAL(&queue_lock);
             const size_t slot = (queue_head + queue_count) % kQueueDepth;
-            std::memcpy(queue[slot], event->data, event->data_len);
-            queue[slot][event->data_len] = '\0';
+            std::memcpy(queue[slot], text, sizeof(text));
             if (queue_count < kQueueDepth) {
                 queue_count++;
             } else {

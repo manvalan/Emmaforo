@@ -7,13 +7,14 @@
 #include "esp_wifi_default.h"
 #include "mdns.h"
 #include "nvs_flash.h"
+#include "sdkconfig.h"
 
 static const char *WIFI_TAG = "WIFI_MGR";
 
 namespace {
 bool mdns_ready = false;
 
-void publish_emmaforo()
+[[maybe_unused]] void publish_emmaforo()
 {
     if (!mdns_ready) {
         if (mdns_init() != ESP_OK) {
@@ -435,7 +436,9 @@ void WifiManager::event_handler(void *arg, esp_event_base_t event_base, int32_t 
         if (event != nullptr) {
             ESP_LOGI(WIFI_TAG, "Joined stored network at " IPSTR, IP2STR(&event->ip_info.ip));
         }
+#if CONFIG_EMMAFORO_HTTP_PORTAL
         publish_emmaforo();
+#endif
         if (self->owner_task_ != nullptr) xTaskNotifyGive(self->owner_task_);
     }
 }

@@ -20,6 +20,11 @@
 // result is kept in NVS with its BSSID, so a different router is probed again.
 // Commands and state go through an MQTT broker with a persistent session, so
 // commands sent while the board sleeps are delivered at the next check-in.
+//
+// Privacy: no account and no hardware identifier. The phone creates a random
+// key and writes it over Bluetooth; topic names are derived from it and every
+// payload is sealed with it (remote_crypto.h), so the broker only sees random
+// topics and ciphertext. Remote control cannot be turned on without a key.
 class RemoteLink {
 public:
     enum class Mode : uint8_t { Off, Usb, Twt, Interval };
@@ -29,12 +34,13 @@ public:
     static constexpr uint8_t kMinIntervalMinutes = 1;
     static constexpr uint8_t kMaxIntervalMinutes = 60;
 
-    void begin(const char *device_id);
+    void begin();
     bool enabled() const { return enabled_; }
     uint8_t interval_minutes() const { return interval_minutes_; }
 
-    // Text commands from Bluetooth: "on", "off", "interval:<minutes>",
-    // "broker:<uri>", "user:<name>", "pass:<secret>". Stored in NVS.
+    // Text commands from Bluetooth: "key:<64 hex>", "forget", "on", "off",
+    // "interval:<minutes>", "broker:<uri>", "user:<name>", "pass:<secret>".
+    // Stored in NVS. The key can be written but never read back.
     bool apply_command(const char *command);
 
     // Mode is published as its number: 0 off, 1 usb, 2 twt, 3 interval.
@@ -59,6 +65,8 @@ private:
     static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data);
     static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data);
     void load();
+    void derive_keys();
+    void save_sequence(uint64_t sequence) const;
     esp_err_t save() const;
     void save_router() const;
     void start_mqtt();
@@ -73,9 +81,15 @@ private:
     char broker_[128] = {};
     char user_[64] = {};
     char pass_[64] = {};
-    char device_id_[16] = {};
-    char cmd_topic_[48] = {};
-    char state_topic_[48] = {};
+    uint8_t key_[32] = {};
+    bool has_key_ = false;
+    uint8_t command_key_[32] = {};
+    uint8_t state_key_[32] = {};
+    char topic_id_[33] = {};
+    char client_id_[24] = {};
+    char cmd_topic_[56] = {};
+    char state_topic_[56] = {};
+    volatile uint64_t last_sequence_ = 0;
 
     Mode mode_ = Mode::Off;
     Router router_ = Router::Unknown;

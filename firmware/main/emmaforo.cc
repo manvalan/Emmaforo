@@ -389,11 +389,15 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "Event loop init failed: %s", esp_err_to_name(ret));
     }
 
+    // The local HTTP page has no authentication. Everything it did is now done
+    // over Bluetooth, so it stays off unless a build turns it on explicitly.
     SetupPortal portal;
+#if CONFIG_EMMAFORO_HTTP_PORTAL
     ret = portal.begin(charger, rgb_led);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "HTTP setup portal failed: %s", esp_err_to_name(ret));
     }
+#endif
 
     BluetoothManager bluetooth;
     uint8_t stored_colors[SettingsStore::kLampColorPresetSize] = {};
@@ -419,11 +423,8 @@ extern "C" void app_main(void)
     bluetooth.set_network_status(network_settings.ssid, false, "", network_settings.password[0] != '\0');
     if (ret == ESP_OK) firmware_update_mark_valid();
 
-    char device_id[13] = {};
-    std::snprintf(device_id, sizeof(device_id), "%02X%02X%02X%02X%02X%02X", factory_mac[0], factory_mac[1],
-                  factory_mac[2], factory_mac[3], factory_mac[4], factory_mac[5]);
     RemoteLink remote;
-    remote.begin(device_id);
+    remote.begin();
 
     SerialRgbLed::Color led_color = {0, 0, 0};
     bool led_blink = false;

@@ -1,0 +1,4 @@
+# Anonymous clients may only use Emmaforo topics. Topic ids are 128-bit values
+# derived from a key that exists only on the phone and on the lamp.
+topic readwrite emmaforo/+/cmd
+topic readwrite emmaforo/+/state

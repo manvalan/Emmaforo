@@ -20,12 +20,16 @@ Si attiva dall'app (caratteristica `FFEC`) e usa la rete Wi‑Fi salvata. La sch
 
 Il router viene provato la prima volta che la scheda lo raggiunge a batteria. Il risultato resta in NVS insieme al BSSID, quindi un router diverso viene provato di nuovo. Se un router TWT non si raggiunge per 30 s, la scheda riprova dopo un intervallo invece di insistere.
 
-Il collegamento passa da un broker MQTT (`CONFIG_EMMAFORO_REMOTE_BROKER`, default `mqtts://emmaforo.michelebigi.it:8883`) con sessione persistente, così i comandi QoS 1 inviati mentre la scheda dorme arrivano al controllo successivo:
+Il collegamento passa da un broker MQTT (`CONFIG_EMMAFORO_REMOTE_BROKER`, default `mqtts://emmaforo.michelebigi.it:8883`, configurazione in `server/`) con sessione persistente, così i comandi inviati mentre la scheda dorme arrivano al controllo successivo.
 
-- `emmaforo/<MAC>/cmd`: comandi con lo stesso testo del Bluetooth, cioè `destinazione,colore,lampeggio,intervallo,livello`, `pause:0|1`, `gentle:0|1`, `riposo`
-- `emmaforo/<MAC>/state` (retained): JSON con percentuale mostrata, carica, USB, lampada, riposo, modo (0 spento, 1 USB, 2 TWT, 3 intervalli), intervallo e firmware
+Privacy: nessun account e nessun identificativo hardware. L'app genera una chiave casuale a 256 bit, la tiene nel Portachiavi e la scrive sulla scheda via Bluetooth (`key:`). Dalla chiave derivano i topic `emmaforo/<id>/cmd` e `emmaforo/<id>/state` e tutti i payload sono sigillati con AES-256-GCM (`remote_crypto.h`), con una sequenza crescente contro la ripetizione. Il broker vede solo topic casuali e dati cifrati. Senza chiave il controllo remoto non si attiva. Dettagli in [docs/privacy-e-app-store.md](docs/privacy-e-app-store.md).
 
-`FFEC` in scrittura accetta `on`, `off`, `interval:<minuti>`, `broker:<uri>`, `user:<nome>`, `pass:<segreto>`; in lettura restituisce `1\tattivo\tminuti\tmodo\trouter\tbroker`, con router 0 non provato, 1 senza TWT, 2 con TWT.
+- Comandi: lo stesso testo del Bluetooth, cioè `destinazione,colore,lampeggio,intervallo,livello`, `pause:0|1`, `gentle:0|1`, `riposo`.
+- Stato (retained): JSON con percentuale mostrata, carica, USB, lampada, riposo, modo (0 spento, 1 USB, 2 TWT, 3 intervalli), intervallo e firmware.
+
+`FFEC` in scrittura accetta `key:<64 hex>`, `forget`, `on`, `off`, `interval:<minuti>`, `broker:<uri>`, `user:<nome>`, `pass:<segreto>`; la chiave non si rilegge mai. In lettura restituisce `1\tattivo\tminuti\tmodo\trouter\tbroker\tchiave`, con router 0 non provato, 1 senza TWT, 2 con TWT.
+
+La vecchia pagina HTTP locale e `emmaforo.local` sono spente (`CONFIG_EMMAFORO_HTTP_PORTAL`), perché non avevano password.
 
 ## Batteria
 

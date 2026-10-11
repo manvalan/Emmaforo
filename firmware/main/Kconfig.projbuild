@@ -38,4 +38,11 @@ menu "Emmaforo"
             On battery with a Wi-Fi 6 router, the radio wakes this often to
             receive commands. Longer saves battery, shorter answers sooner.
 
+    config EMMAFORO_HTTP_PORTAL
+        bool "Local HTTP page and emmaforo.local (no authentication)"
+        default n
+        help
+            The old setup page on the home network. It has no password, so it
+            is off: Bluetooth and the encrypted remote link replace it.
+
 endmenu
