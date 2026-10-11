@@ -3,13 +3,16 @@
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
+#include <cstdlib>
 
+#include "battery_log.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
@@ -55,13 +58,16 @@ bool battery_paused = false;
 bool battery_gentle = false;
 bool battery_estimate_valid = false;
 bool battery_power_good = false;
+bool battery_gauge = false;
+int16_t battery_rate_centi = 0;
+uint8_t battery_gauge_alerts = 0;
 bool charge_pause_requested = false;
 bool pending_pause_value = false;
 bool gentle_charge_requested = false;
 bool pending_gentle_value = false;
 bool shutdown_requested = false;
 char network_status[96] = {};
-char last_battery_notification[64] = {};
+char last_battery_notification[80] = {};
 uint8_t color_preset[kColorPresetSize] = {};
 uint8_t pending_color_preset[kColorPresetSize] = {};
 bool color_preset_requested = false;
@@ -72,6 +78,8 @@ wifi_ap_record_t scan_records[20] = {};
 uint16_t scan_results_handle = 0;
 uint16_t network_status_handle = 0;
 uint16_t battery_handle = 0;
+uint16_t battery_log_handle = 0;
+bool log_dump_running = false;
 uint16_t scan_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 TaskHandle_t app_task_handle = nullptr;
 
@@ -97,15 +105,119 @@ const ble_uuid16_t kColorPresetUuid = BLE_UUID16_INIT(0xFFFD);
 const ble_uuid16_t kSerialUuid = BLE_UUID16_INIT(0xFFFE);
 const ble_uuid16_t kFirmwareVersionUuid = BLE_UUID16_INIT(0xFFEF);
 const ble_uuid16_t kFirmwareApproveUuid = BLE_UUID16_INIT(0xFFEE);
+// Added after app 1.0: older apps never discover it.
+const ble_uuid16_t kBatteryLogUuid = BLE_UUID16_INIT(0xFFED);
 
+// Fields 0-9 are what app 1.0 parses. Fields 10-12 were added later and are
+// ignored by it: gauge present, rate in 0.1 %/h, gauge alert flags.
 int format_battery(char *measurement, size_t size)
 {
-    return std::snprintf(measurement, size, "%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u",
+    return std::snprintf(measurement, size, "%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%d\t%u",
                          battery_percentage, battery_voltage_mv,
                          battery_charging ? 1 : 0, battery_charge_status,
                          battery_fault, battery_safe ? 1 : 0,
                          battery_paused ? 1 : 0, battery_gentle ? 1 : 0,
-                         battery_estimate_valid ? 1 : 0, battery_power_good ? 1 : 0);
+                         battery_estimate_valid ? 1 : 0, battery_power_good ? 1 : 0,
+                         battery_gauge ? 1 : 0, battery_rate_centi / 10, battery_gauge_alerts);
+}
+
+// Battery log transfer. Data packets: 0xB1, u16 first index, then 16-byte
+// samples. End packet: 0xBE, u16 count, u16 capacity, u16 period s,
+// u32 uptime s, u32 unix now (0 if unknown), u8 boot. Little-endian.
+constexpr uint8_t kLogDataMarker = 0xB1;
+constexpr uint8_t kLogEndMarker = 0xBE;
+
+void put_u16(uint8_t *out, uint16_t value)
+{
+    out[0] = static_cast<uint8_t>(value & 0xFF);
+    out[1] = static_cast<uint8_t>(value >> 8);
+}
+
+void put_u32(uint8_t *out, uint32_t value)
+{
+    for (int index = 0; index < 4; ++index) out[index] = static_cast<uint8_t>(value >> (8 * index));
+}
+
+bool notify_log_packet(uint16_t conn_handle, const uint8_t *data, uint16_t length)
+{
+    // Notifications fail with ENOMEM while the controller buffers are full:
+    // wait and retry instead of dropping samples.
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        if (scan_conn_handle != conn_handle) return false;
+        struct os_mbuf *mbuf = ble_hs_mbuf_from_flat(data, length);
+        if (mbuf != nullptr && ble_gatts_notify_custom(conn_handle, battery_log_handle, mbuf) == 0) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return false;
+}
+
+void log_dump_task(void *arg)
+{
+    const uint16_t conn_handle = static_cast<uint16_t>(reinterpret_cast<uintptr_t>(arg));
+    const battery_log::Summary summary = battery_log::summary();
+    uint16_t payload = static_cast<uint16_t>(ble_att_mtu(conn_handle) - 3);
+    if (payload > 244) payload = 244;
+    if (payload < 3 + sizeof(BatteryLogSample)) payload = 3 + sizeof(BatteryLogSample);
+    const size_t per_packet = (payload - 3) / sizeof(BatteryLogSample);
+    uint8_t packet[244] = {};
+    BatteryLogSample samples[15] = {};
+    bool ok = true;
+    uint32_t index = 0;
+    while (ok && index < summary.count) {
+        const size_t copied = battery_log::copy(index, samples, std::min<size_t>(per_packet, 15));
+        if (copied == 0) break;
+        packet[0] = kLogDataMarker;
+        put_u16(packet + 1, static_cast<uint16_t>(index));
+        std::memcpy(packet + 3, samples, copied * sizeof(BatteryLogSample));
+        ok = notify_log_packet(conn_handle, packet, static_cast<uint16_t>(3 + copied * sizeof(BatteryLogSample)));
+        index += copied;
+    }
+    if (ok) {
+        packet[0] = kLogEndMarker;
+        put_u16(packet + 1, static_cast<uint16_t>(index));
+        put_u16(packet + 3, static_cast<uint16_t>(summary.capacity));
+        put_u16(packet + 5, static_cast<uint16_t>(summary.period_s));
+        put_u32(packet + 7, summary.uptime_s);
+        put_u32(packet + 11, summary.epoch_now);
+        packet[15] = summary.boot;
+        ok = notify_log_packet(conn_handle, packet, 16);
+    }
+    ESP_LOGI(kTag, "Battery log sent: %lu samples%s", static_cast<unsigned long>(index), ok ? "" : ", interrupted");
+    log_dump_running = false;
+    vTaskDelete(nullptr);
+}
+
+int battery_log_write(struct ble_gatt_access_ctxt *ctxt, uint16_t conn_handle)
+{
+    char command[24] = {};
+    const uint16_t length = OS_MBUF_PKTLEN(ctxt->om);
+    if (length == 0 || length >= sizeof(command) ||
+        ble_hs_mbuf_to_flat(ctxt->om, command, length, nullptr) != 0) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+    command[length] = '\0';
+    if (std::strncmp(command, "time:", 5) == 0) {
+        battery_log::set_time(static_cast<uint32_t>(std::strtoul(command + 5, nullptr, 10)));
+        return 0;
+    }
+    if (std::strcmp(command, "clear") == 0) {
+        if (log_dump_running) return BLE_ATT_ERR_UNLIKELY;
+        battery_log::clear();
+        return 0;
+    }
+    if (std::strcmp(command, "dump") == 0) {
+        if (!battery_log::enabled() || log_dump_running || battery_log_handle == 0) return BLE_ATT_ERR_UNLIKELY;
+        log_dump_running = true;
+        if (xTaskCreate(log_dump_task, "batt_log_tx", 4096,
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(conn_handle)), 3, nullptr) != pdPASS) {
+            log_dump_running = false;
+            return BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        return 0;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
 }
 int on_gap_event(struct ble_gap_event *event, void *arg);
 
@@ -132,10 +244,29 @@ void fail_scan(const char *reason)
     notify_scan_results();
 }
 
-int gatt_access(uint16_t, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *)
+int gatt_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *)
 {
     if (ctxt == nullptr) {
         return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    if (ctxt->chr != nullptr && ble_uuid_cmp(ctxt->chr->uuid, &kBatteryLogUuid.u) == 0) {
+        if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) return battery_log_write(ctxt, conn_handle);
+        if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+        // Text summary: format, count, capacity, period s, uptime s, unix now, boot, enabled.
+        const battery_log::Summary summary = battery_log::summary();
+        char text[80] = {};
+        const int length = std::snprintf(text, sizeof(text), "1\t%lu\t%lu\t%lu\t%lu\t%lu\t%u\t%u",
+                                         static_cast<unsigned long>(summary.count),
+                                         static_cast<unsigned long>(summary.capacity),
+                                         static_cast<unsigned long>(summary.period_s),
+                                         static_cast<unsigned long>(summary.uptime_s),
+                                         static_cast<unsigned long>(summary.epoch_now),
+                                         summary.boot, summary.enabled ? 1 : 0);
+        if (length <= 0) return BLE_ATT_ERR_UNLIKELY;
+        if (ctxt->offset > length) return BLE_ATT_ERR_INVALID_OFFSET;
+        return os_mbuf_append(ctxt->om, text + ctxt->offset, static_cast<size_t>(length) - ctxt->offset) == 0
+            ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR && ctxt->chr != nullptr &&
@@ -154,7 +285,7 @@ int gatt_access(uint16_t, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctx
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR && ctxt->chr != nullptr &&
         ble_uuid_cmp(ctxt->chr->uuid, &kBatteryUuid.u) == 0) {
         if (!battery_measurement_valid) return BLE_ATT_ERR_UNLIKELY;
-        char measurement[64] = {};
+        char measurement[sizeof(last_battery_notification)] = {};
         const int length = format_battery(measurement, sizeof(measurement));
         if (length <= 0) return BLE_ATT_ERR_UNLIKELY;
         if (ctxt->offset >= static_cast<uint16_t>(length)) return 0;
@@ -473,6 +604,12 @@ const ble_gatt_svc_def services[] = {
                 .access_cb = gatt_access,
                 .flags = BLE_GATT_CHR_F_WRITE,
             },
+            {
+                .uuid = &kBatteryLogUuid.u,
+                .access_cb = gatt_access,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &battery_log_handle,
+            },
             {},
         },
     },
@@ -582,7 +719,8 @@ void BluetoothManager::set_battery_measurement(uint8_t percentage, uint16_t mill
                                                bool charging, uint8_t charge_status, uint8_t fault,
                                                bool safe_charging, bool charge_paused,
                                                bool gentle_charge, bool estimate_valid,
-                                               bool power_good)
+                                               bool power_good, bool gauge, int16_t rate_centi_per_hour,
+                                               uint8_t gauge_alerts)
 {
     battery_percentage = percentage > 100 ? 100 : percentage;
     battery_voltage_mv = millivolts;
@@ -594,6 +732,9 @@ void BluetoothManager::set_battery_measurement(uint8_t percentage, uint16_t mill
     battery_gentle = gentle_charge;
     battery_estimate_valid = estimate_valid;
     battery_power_good = power_good;
+    battery_gauge = gauge;
+    battery_rate_centi = rate_centi_per_hour;
+    battery_gauge_alerts = gauge_alerts;
     battery_measurement_valid = true;
 
     char measurement[sizeof(last_battery_notification)] = {};

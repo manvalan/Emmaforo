@@ -1,0 +1,26 @@
+menu "Emmaforo"
+
+    config EMMAFORO_BATTERY_LOG
+        bool "Keep a battery log in RAM for test devices"
+        default y
+        help
+            Records a battery sample at a fixed period in a RAM ring buffer that
+            survives soft resets (not power loss). A test build of the companion
+            app reads it over Bluetooth and exports it as CSV/JSON. Recording
+            only happens during the normal loop, so it costs no extra wake-ups.
+
+    config EMMAFORO_BATTERY_LOG_PERIOD_S
+        int "Seconds between battery log samples"
+        depends on EMMAFORO_BATTERY_LOG
+        range 10 3600
+        default 120
+
+    config EMMAFORO_BATTERY_LOG_CAPACITY
+        int "Battery log samples kept (16 bytes each)"
+        depends on EMMAFORO_BATTERY_LOG
+        range 256 4096
+        default 3072
+        help
+            3072 samples at 120 s cover a little over four days.
+
+endmenu

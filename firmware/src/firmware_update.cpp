@@ -23,10 +23,32 @@ constexpr char kApprovedKey[] = "fw_ok";
 constexpr char kVersionURL[] = "https://emmaforo.michelebigi.it/firmware/version.txt";
 constexpr char kImageURL[] = "https://emmaforo.michelebigi.it/firmware/emmaforo.bin";
 
+// Wi-Fi is on only while an approved firmware is pending, so a version that
+// never arrives must not keep the radio up: attempts back off and the
+// approval is dropped after a bounded time. The user can approve again.
+constexpr int kMaxAttempts = 5;
+constexpr int64_t kFirstRetryUs = 20LL * 1000000LL;
+constexpr int64_t kJoinGiveUpUs = 5LL * 60 * 1000000LL;
+
 char approved[32] = {};
-bool busy = false;
+volatile bool busy = false;
 bool attempt_now = false;
 int64_t last_attempt_us = 0;
+int attempts = 0;
+int64_t waiting_since_us = 0;
+
+void forget_approval(const char *reason)
+{
+    ESP_LOGW(kTag, "Firmware %s not installed: %s. Approve it again to retry.", approved, reason);
+    approved[0] = '\0';
+    attempts = 0;
+    waiting_since_us = 0;
+    nvs_handle_t handle;
+    if (nvs_open(kNamespace, NVS_READWRITE, &handle) == ESP_OK) {
+        if (nvs_erase_key(handle, kApprovedKey) == ESP_OK) nvs_commit(handle);
+        nvs_close(handle);
+    }
+}
 
 bool version_text(const char *version)
 {
@@ -196,6 +218,8 @@ esp_err_t firmware_update_approve(const char *version)
     if (err != ESP_OK) return err;
     std::snprintf(approved, sizeof(approved), "%s", version);
     attempt_now = true;
+    attempts = 0;
+    waiting_since_us = 0;
     ESP_LOGI(kTag, "Approved firmware %s", approved);
     return ESP_OK;
 }
@@ -212,11 +236,26 @@ bool firmware_update_busy()
 
 void firmware_update_poll(bool wifi_connected)
 {
-    if (busy || !wifi_connected || !firmware_update_pending()) return;
+    if (busy || !firmware_update_pending()) {
+        if (!busy) waiting_since_us = 0;
+        return;
+    }
     const int64_t now = esp_timer_get_time();
-    if (!attempt_now && last_attempt_us != 0 && now - last_attempt_us < 20LL * 1000000LL) return;
+    if (!wifi_connected) {
+        if (waiting_since_us == 0) waiting_since_us = now;
+        if (now - waiting_since_us >= kJoinGiveUpUs) forget_approval("the stored network was not joined");
+        return;
+    }
+    waiting_since_us = 0;
+    if (attempts >= kMaxAttempts) {
+        forget_approval("the download kept failing");
+        return;
+    }
+    const int64_t backoff = kFirstRetryUs << (attempts > 0 ? attempts - 1 : 0);
+    if (!attempt_now && last_attempt_us != 0 && now - last_attempt_us < backoff) return;
     attempt_now = false;
     last_attempt_us = now;
+    attempts++;
     busy = true;
     if (xTaskCreate(update_task, "fw_update", 20480, nullptr, 5, nullptr) != pdPASS) {
         busy = false;

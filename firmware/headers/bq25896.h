@@ -26,6 +26,7 @@ public:
     esp_err_t BQ_set_charge_current_ma(uint16_t milliamps);
     esp_err_t BQ_get_charge_current_setting_ma(uint16_t *milliamps) const;
     esp_err_t BQ_set_charge_voltage_mv(uint16_t millivolts);
+    esp_err_t BQ_set_termination_current_ma(uint16_t milliamps);
     esp_err_t BQ_set_input_current_limit_ma(uint16_t milliamps);
     esp_err_t BQ_set_charging_enabled(bool enabled);
     esp_err_t BQ_pet_watchdog();
@@ -33,6 +34,10 @@ public:
     esp_err_t BQ_set_battery_fet_enabled(bool enabled);
     esp_err_t BQ_shutdown_circuit();
     esp_err_t BQ_set_system_min_voltage_mv(uint16_t millivolts);
+    // Continuous ADC is needed when the cell voltage comes from the charger.
+    // With a fuel gauge one conversion per sample is enough.
+    esp_err_t BQ_set_adc_continuous(bool continuous);
+    esp_err_t BQ_start_adc_conversion();
     esp_err_t BQ_get_charge_status(ChargeStatus *status) const;
     esp_err_t BQ_get_fault(uint8_t *fault) const;
     esp_err_t BQ_get_part_number(uint8_t *part_number) const;

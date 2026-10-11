@@ -20,7 +20,8 @@ public:
     void set_battery_measurement(uint8_t percentage, uint16_t millivolts, bool charging,
                                  uint8_t charge_status, uint8_t fault, bool safe_charging,
                                  bool charge_paused, bool gentle_charge, bool estimate_valid,
-                                 bool power_good);
+                                 bool power_good, bool gauge = false, int16_t rate_centi_per_hour = 0,
+                                 uint8_t gauge_alerts = 0);
     bool take_charge_pause(bool *paused);
     bool take_gentle_charge(bool *gentle);
     bool take_shutdown();

@@ -12,9 +12,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "battery_log.h"
+#include "battery_policy.h"
 #include "battery_status.h"
 #include "bluetooth_manager.h"
 #include "firmware_update.h"
+#include "max17048.h"
 #include "serial_rgb_led.h"
 #include "settings_store.h"
 #include "setup_portal.h"
@@ -64,10 +67,14 @@ static uint8_t scale_channel(uint8_t channel, uint8_t level)
 #define I2C_USE_INTERNAL_PULLUP false
 #define STATUS_RGB_GPIO         GPIO_NUM_20
 
-static constexpr uint8_t kChargeStopPercentage = 95;
-static constexpr uint8_t kChargeResumePercentage = 20;
-static constexpr uint16_t kGentleChargeMilliamps = 512;
-static constexpr uint16_t kNormalChargeMilliamps = 2048;
+// Fuel gauge alerts: empty at 10%, cell under 3.40 V or over 4.30 V.
+static constexpr uint8_t kGaugeEmptyAlertPercent = 10;
+static constexpr uint16_t kGaugeLowAlertMv = 3400;
+static constexpr uint16_t kGaugeHighAlertMv = 4300;
+// While resting the loop still wakes this often, so safe charging keeps its
+// limits when the board sits on a charger.
+static constexpr uint32_t kRestLoopMs = 60000;
+static constexpr int64_t kBatteryReadMinUs = 5LL * 1000000LL;
 static constexpr char kApSsid[] = "Emmaforo-Setup";
 static constexpr char kApPassword[] = "emmaforo";
 
@@ -112,8 +119,10 @@ struct ChargeWindow {
     bool reached_stop;
 };
 
+// shown_percent is the percent the user sees (battery_policy::shown_percent).
+// Outside safe mode the charger itself stops at the 95% point.
 static ChargeWindow safe_charge_window(bool safe_mode, bool user_paused, bool climb,
-                                        bool percent_known, uint8_t percent)
+                                        bool percent_known, uint8_t shown_percent)
 {
     ChargeWindow decision = {true, false, false};
     if (user_paused) {
@@ -128,23 +137,34 @@ static ChargeWindow safe_charge_window(bool safe_mode, bool user_paused, bool cl
         decision.allow = false;
         return decision;
     }
-    if (percent >= kChargeStopPercentage) {
+    if (shown_percent >= battery_policy::kSafeStopShownPercent) {
         decision.allow = false;
         decision.reached_stop = true;
         return decision;
     }
-    if (percent <= kChargeResumePercentage) {
-        decision.allow = true;
-        decision.climb = true;
-        return decision;
-    }
-    if (climb) {
+    if (shown_percent < battery_policy::kSafeResumeBelowShownPercent || climb) {
         decision.allow = true;
         decision.climb = true;
         return decision;
     }
     decision.allow = false;
     return decision;
+}
+
+static uint16_t charge_current_for(bool safe_mode, bool gentle)
+{
+    if (safe_mode) return battery_policy::kSafeTopUpMilliamps;
+    return gentle ? battery_policy::kGentleChargeMilliamps : battery_policy::kNormalChargeMilliamps;
+}
+
+static void apply_charge_current(BQ &charger, bool charger_ready, uint16_t milliamps, uint16_t *applied_ma)
+{
+    if (!charger_ready || applied_ma == nullptr || *applied_ma == milliamps) return;
+    if (charger.BQ_set_charge_current_ma(milliamps) == ESP_OK) {
+        *applied_ma = milliamps;
+    } else {
+        ESP_LOGW(TAG, "Charge current was not applied");
+    }
 }
 
 static void apply_charger_enable(BQ &charger, bool charger_ready, bool allow, bool *charging_enabled)
@@ -233,12 +253,25 @@ extern "C" void app_main(void)
     ret = charger.BQ_begin();
     const bool charger_ready = ret == ESP_OK;
     bool charging_enabled = charger_ready;
-    Bq25896EstimateSource battery_gauge;
     if (charger_ready) {
         ESP_LOGI(TAG, "BQ25896 driver initialized at 0x%02X", BQ::kDefaultAddress);
     } else {
         ESP_LOGW(TAG, "BQ25896 driver initialization failed: %s", esp_err_to_name(ret));
     }
+
+    // Boards exist with and without the MAX17048G. Without it, or if it does
+    // not answer now, the BQ25896 estimate is used exactly as before.
+    Max17048 gauge(bus_handle);
+    ret = gauge.begin(kGaugeEmptyAlertPercent, kGaugeLowAlertMv, kGaugeHighAlertMv);
+    const bool gauge_ready = ret == ESP_OK;
+    if (!gauge_ready) {
+        ESP_LOGI(TAG, "No MAX17048 fuel gauge (%s): using the charger estimate", esp_err_to_name(ret));
+    }
+    Bq25896EstimateSource estimate_source;
+    Max17048Source gauge_source(gauge, estimate_source);
+    BatteryStatusSource &battery = gauge_ready ? static_cast<BatteryStatusSource &>(gauge_source)
+                                               : static_cast<BatteryStatusSource &>(estimate_source);
+    battery_log::init();
 
     firmware_update_load();
     ESP_LOGI(TAG, "Firmware version %s", firmware_version());
@@ -284,13 +317,26 @@ extern "C" void app_main(void)
         charge_climb = false;
     }
     if (remembered_known) {
-        battery_gauge.restore(remembered_percent);
+        estimate_source.restore(remembered_percent);
         saved_climb = charge_climb;
         ESP_LOGI(TAG, "Battery estimate restored at %u%%", remembered_percent);
     } else {
         charge_climb = false;
     }
+    uint8_t boot_percent = remembered_percent;
+    bool boot_known = remembered_known;
+    if (gauge_ready) {
+        uint16_t soc = 0;
+        if (gauge.read_soc_x256(&soc) == ESP_OK) {
+            const uint32_t percent = (static_cast<uint32_t>(soc) + 128U) / 256U;
+            boot_percent = static_cast<uint8_t>(percent > 100U ? 100U : percent);
+            boot_known = true;
+            estimate_source.anchor(boot_percent);
+            ESP_LOGI(TAG, "Fuel gauge reports %u%% at boot", boot_percent);
+        }
+    }
     ESP_LOGI(TAG, "Stored network joins unless a phone holds Bluetooth");
+    uint16_t applied_charge_ma = 0;
     if (charger_ready) {
         if (charger.BQ_pet_watchdog() != ESP_OK) {
             ESP_LOGW(TAG, "Charger watchdog was not reset");
@@ -298,33 +344,37 @@ extern "C" void app_main(void)
         if (charger.BQ_disable_watchdog() != ESP_OK) {
             ESP_LOGW(TAG, "Charger watchdog was not disabled");
         }
-        const uint16_t charge_ma = network_settings.gentle_charge ? kGentleChargeMilliamps
-                                                                  : kNormalChargeMilliamps;
-        if (charger.BQ_set_charge_current_ma(charge_ma) != ESP_OK) {
-            ESP_LOGW(TAG, "Charge current was not applied");
+        if (charger.BQ_set_charge_voltage_mv(battery_policy::kChargeVoltageMv) != ESP_OK) {
+            ESP_LOGW(TAG, "Charge voltage was not applied");
         }
+        if (charger.BQ_set_termination_current_ma(battery_policy::kTerminationMilliamps) != ESP_OK) {
+            ESP_LOGW(TAG, "Termination current was not applied");
+        }
+        if (gauge_ready && charger.BQ_set_adc_continuous(false) != ESP_OK) {
+            ESP_LOGW(TAG, "Charger ADC stays in continuous mode");
+        }
+        apply_charge_current(charger, charger_ready,
+                             charge_current_for(network_settings.safe_charging_mode != 0,
+                                                network_settings.gentle_charge != 0),
+                             &applied_charge_ma);
         const ChargeWindow boot_window = safe_charge_window(
             network_settings.safe_charging_mode != 0, user_charge_paused, charge_climb,
-            remembered_known, remembered_percent);
+            boot_known, battery_policy::shown_percent(boot_percent));
         charge_climb = boot_window.climb;
         apply_charger_enable(charger, charger_ready, boot_window.allow, &charging_enabled);
-        if (boot_window.reached_stop && remembered_known) {
-            battery_gauge.anchor(kChargeStopPercentage);
-            remembered_percent = kChargeStopPercentage;
-        }
         if (!boot_window.allow) {
             if (user_charge_paused) {
                 ESP_LOGI(TAG, "Charging paused");
             } else if (boot_window.reached_stop) {
-                ESP_LOGI(TAG, "Battery at %u%%: charging paused", kChargeStopPercentage);
-            } else if (remembered_known) {
-                ESP_LOGI(TAG, "Battery at %u%%: safe charge stays off", remembered_percent);
+                ESP_LOGI(TAG, "Battery at %u%%: safe charge holds", battery_policy::shown_percent(boot_percent));
+            } else if (boot_known) {
+                ESP_LOGI(TAG, "Battery at %u%%: safe charge stays off", battery_policy::shown_percent(boot_percent));
             } else {
-                ESP_LOGI(TAG, "Safe charge stays off until the estimate is %u%% or below",
-                         kChargeResumePercentage);
+                ESP_LOGI(TAG, "Safe charge stays off until the battery is known below %u%%",
+                         battery_policy::kSafeResumeBelowShownPercent);
             }
         } else if (network_settings.safe_charging_mode != 0) {
-            ESP_LOGI(TAG, "Battery at %u%%: charging resumed", remembered_percent);
+            ESP_LOGI(TAG, "Battery at %u%%: gentle top-up", battery_policy::shown_percent(boot_percent));
         }
     }
 
@@ -359,16 +409,12 @@ extern "C" void app_main(void)
              network_settings.ssid[0] == '\0' ? "none" : "stored",
              network_settings.safe_charging_mode, network_settings.charge_paused,
              network_settings.gentle_charge ? "gentle" : "normal", stored_color_count);
+    // Bluetooth is the only normal link: a new image is confirmed only once it is up.
     ret = bluetooth.begin(network_settings.device_name, network_settings.safe_charging_mode != 0);
-    const std::string initial_ip = wifi.station_ip();
-    bluetooth.set_network_status(network_settings.ssid, wifi.is_connected(), initial_ip.c_str(),
-                                 network_settings.password[0] != '\0');
-    if (wifi.needs_configuration()) {
-        ret = bluetooth.begin(network_settings.device_name, network_settings.safe_charging_mode != 0);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Bluetooth configuration failed: %s", esp_err_to_name(ret));
-        }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluetooth configuration failed: %s", esp_err_to_name(ret));
     }
+    bluetooth.set_network_status(network_settings.ssid, false, "", network_settings.password[0] != '\0');
     if (ret == ESP_OK) firmware_update_mark_valid();
 
     SerialRgbLed::Color led_color = {0, 0, 0};
@@ -378,7 +424,10 @@ extern "C" void app_main(void)
     uint32_t led_blink_interval_ms = 1000;
     uint8_t led_level = 255;
     bool configuration_led_mode = false;
-    BatteryStatusSource &battery = battery_gauge;
+    BatteryStatus status = {};
+    bool have_status = false;
+    bool was_resting = false;
+    int64_t last_battery_read_us = 0;
 
     while (1) {
         char configured_ssid[64] = {};
@@ -481,12 +530,6 @@ extern "C" void app_main(void)
             current_changed = true;
         }
         if (current_changed) {
-            if (charger_ready) {
-                const uint16_t charge_ma = gentle_charge ? kGentleChargeMilliamps : kNormalChargeMilliamps;
-                if (charger.BQ_set_charge_current_ma(charge_ma) != ESP_OK) {
-                    ESP_LOGW(TAG, "Charge current was not applied");
-                }
-            }
             network_settings.gentle_charge = gentle_charge ? 1 : 0;
             if (settings_store.save(network_settings) != ESP_OK) {
                 ESP_LOGE(TAG, "Could not save charge current");
@@ -584,10 +627,13 @@ extern "C" void app_main(void)
         const bool ble_connected = bluetooth.is_connected();
         const bool ble_held = bluetooth.link_is_held();
         const int64_t now_us = esp_timer_get_time();
-        const bool want_wifi = !resting && network_settings.ssid[0] != '\0' && !ble_held;
+        // Wi-Fi is off by default. It joins the stored network only to fetch a
+        // firmware the user approved, and only for as long as that takes.
+        const bool update_wanted = firmware_update_pending();
+        const bool want_wifi = !resting && network_settings.ssid[0] != '\0' && update_wanted;
         if (ble_held) {
             if (!logged_ble_hold) {
-                ESP_LOGI(TAG, "Bluetooth held: stored network stays down");
+                ESP_LOGI(TAG, "Bluetooth session held");
                 logged_ble_hold = true;
             }
         } else {
@@ -600,7 +646,7 @@ extern "C" void app_main(void)
                 if (retry) {
                     ESP_LOGI(TAG, "Stored network not joined, retrying %s", network_settings.ssid);
                 } else {
-                    ESP_LOGI(TAG, "No Bluetooth session: joining stored network %s", network_settings.ssid);
+                    ESP_LOGI(TAG, "Firmware update approved: joining stored network %s", network_settings.ssid);
                 }
                 const esp_err_t wifi_ret = wifi.begin_sta(network_settings.ssid, network_settings.password);
                 if (wifi_ret == ESP_OK) {
@@ -613,13 +659,10 @@ extern "C" void app_main(void)
                 }
             }
         } else if (!want_wifi && wifi_on && !firmware_update_busy()) {
-            const std::string learned_ip = wifi.station_ip();
-            bluetooth.set_network_status(network_settings.ssid, wifi.is_connected(), learned_ip.c_str(),
-                                         network_settings.password[0] != '\0');
             wifi.stop();
             wifi_on = false;
             sta_join_started = false;
-            ESP_LOGI(TAG, "Bluetooth held: Wi-Fi off");
+            ESP_LOGI(TAG, "No firmware to fetch: Wi-Fi off");
         }
         const bool wifi_connected = wifi_on && wifi.is_connected();
         firmware_update_poll(wifi_connected);
@@ -627,16 +670,24 @@ extern "C" void app_main(void)
         bluetooth.set_network_status(network_settings.ssid, wifi_connected, station_ip.c_str(),
                                      network_settings.password[0] != '\0');
         if (configuration_led_mode) {
+            // Bluetooth is the link: green when a phone is connected, amber
+            // blinking while waiting for one, red blinking while an approved
+            // firmware is being fetched.
             led_on = true;
-            led_blink = !wifi_connected;
-            led_color = !wifi_connected ? SerialRgbLed::Color{255, 0, 0}
-                : (ble_connected ? SerialRgbLed::Color{0, 255, 0} : SerialRgbLed::Color{255, 180, 0});
+            if (update_wanted) {
+                led_blink = true;
+                led_color = SerialRgbLed::Color{255, 0, 0};
+            } else {
+                led_blink = !ble_connected;
+                led_color = ble_connected ? SerialRgbLed::Color{0, 255, 0} : SerialRgbLed::Color{255, 180, 0};
+            }
         }
 
+        const SerialRgbLed::Color shown_led = {scale_channel(led_color.r, led_level),
+                                               scale_channel(led_color.g, led_level),
+                                               scale_channel(led_color.b, led_level)};
         if (led_on && (!led_blink || led_phase)) {
-            rgb_led.set_pixel(0, scale_channel(led_color.r, led_level),
-                              scale_channel(led_color.g, led_level),
-                              scale_channel(led_color.b, led_level));
+            rgb_led.set_pixel(0, shown_led.r, shown_led.g, shown_led.b);
         } else {
             rgb_led.set_pixel(0, 0, 0, 0);
         }
@@ -644,37 +695,43 @@ extern "C" void app_main(void)
         if (led_on && led_blink) led_phase = !led_phase;
 
         const bool safe_mode = network_settings.safe_charging_mode != 0;
-        BatteryStatus status = battery.read(charger, led_on, safe_mode);
-        uint8_t fault = 0;
-        if (charger.BQ_get_fault(&fault) == ESP_OK) status.fault = fault;
+        // A blinking lamp runs this loop up to twice a second. The battery
+        // does not change that fast, so the I2C reads are spaced out.
+        if (!have_status || now_us - last_battery_read_us >= kBatteryReadMinUs || was_resting != resting) {
+            status = battery.read(charger, led_on, safe_mode);
+            uint8_t fault = 0;
+            if (charger.BQ_get_fault(&fault) == ESP_OK) status.fault = fault;
+            last_battery_read_us = now_us;
+            have_status = true;
+        }
+        was_resting = resting;
 
+        apply_charge_current(charger, charger_ready,
+                             charge_current_for(safe_mode, network_settings.gentle_charge != 0),
+                             &applied_charge_ma);
+        const uint8_t shown = battery_policy::shown_percent(status.percent);
         const ChargeWindow window = safe_charge_window(safe_mode, user_charge_paused, charge_climb,
-                                                       status.valid, status.percent);
+                                                       status.valid, shown);
         const bool was_charging = charging_enabled;
         charge_climb = window.climb;
         apply_charger_enable(charger, charger_ready, window.allow, &charging_enabled);
-        if (window.reached_stop && !charging_enabled) {
-            battery.anchor(kChargeStopPercentage);
-            status.percent = kChargeStopPercentage;
-            status.valid = true;
-        }
         if (!charging_enabled) status.charging = false;
         if (was_charging != charging_enabled) {
             if (charging_enabled && status.valid) {
-                ESP_LOGI(TAG, "Battery at %u%%: charging resumed", status.percent);
+                ESP_LOGI(TAG, "Battery at %u%%: charging resumed", shown);
             } else if (user_charge_paused) {
                 ESP_LOGI(TAG, "Charging paused");
             } else if (window.reached_stop) {
-                ESP_LOGI(TAG, "Battery at %u%%: charging paused", status.percent);
+                ESP_LOGI(TAG, "Battery at %u%%: safe charge holds", shown);
             } else if (status.valid) {
-                ESP_LOGI(TAG, "Battery at %u%%: safe charge stays off", status.percent);
+                ESP_LOGI(TAG, "Battery at %u%%: safe charge stays off", shown);
             } else {
-                ESP_LOGI(TAG, "Safe charge stays off until the estimate is %u%% or below",
-                         kChargeResumePercentage);
+                ESP_LOGI(TAG, "Safe charge stays off until the battery is known below %u%%",
+                         battery_policy::kSafeResumeBelowShownPercent);
             }
         }
         uint8_t live_percent = 0;
-        const bool live_known = battery_gauge.estimate(&live_percent);
+        const bool live_known = battery.estimate(&live_percent);
         if (live_known != remembered_known || (live_known && live_percent != remembered_percent) ||
             charge_climb != saved_climb) {
             if (settings_store.save_battery_estimate(live_known, live_known ? live_percent : 0, charge_climb) ==
@@ -687,7 +744,16 @@ extern "C" void app_main(void)
             }
         }
 
-        g_published_battery.percentage = status.percent;
+        BatteryLogContext log_context = {};
+        log_context.lamp_on = led_on;
+        log_context.led_load = static_cast<uint8_t>((shown_led.r + shown_led.g + shown_led.b) / 3);
+        log_context.wifi_on = wifi_on;
+        log_context.ble_connected = ble_connected;
+        log_context.resting = resting;
+        battery_log::record(status, log_context);
+
+        // Everything published uses the shown scale: the 95% point reads 100%.
+        g_published_battery.percentage = shown;
         g_published_battery.voltage_mv = status.voltage_mv;
         g_published_battery.charging = status.charging;
         g_published_battery.charge_status = status.charge_state;
@@ -710,14 +776,16 @@ extern "C" void app_main(void)
         std::snprintf(g_published_info.firmware, sizeof(g_published_info.firmware), "%s", firmware_version());
         std::memcpy(g_published_info.preset, stored_colors, sizeof(g_published_info.preset));
         if (status.voltage_mv != 0 || status.charge_state != 255) {
-            bluetooth.set_battery_measurement(status.percent, status.voltage_mv, status.charging,
+            bluetooth.set_battery_measurement(shown, status.voltage_mv, status.charging,
                                               status.charge_state, status.fault, safe_mode,
                                               user_charge_paused, network_settings.gentle_charge != 0,
-                                              status.valid, status.power_good);
+                                              status.valid, status.power_good, status.gauge,
+                                              status.rate_centi_per_hour, status.gauge_alerts);
         }
 
         if (status.voltage_mv != 0 || status.charge_state != 255) {
-            ESP_LOGI(TAG, "Battery status: %u%%, %u mV, state=%u", status.percent,
+            ESP_LOGI(TAG, "Battery status: %u%% shown (%u.%u%% real%s), %u mV, state=%u", shown,
+                     status.soc_x10 / 10, status.soc_x10 % 10, status.gauge ? ", gauge" : "",
                      status.voltage_mv, status.charge_state);
         } else {
             ESP_LOGW(TAG, "Battery status unavailable");
@@ -728,7 +796,7 @@ extern "C" void app_main(void)
         if (found < 0) {
             ESP_LOGE(TAG, "I2C bus error detected: the bus is not healthy.");
         } else if (found == 0) {
-            ESP_LOGW(TAG, "BQ25896 not found at 0x6A or 0x6B.");
+            ESP_LOGW(TAG, "BQ25896 not found at 0x%02X.", BQ::kDefaultAddress);
         } else {
             ESP_LOGI(TAG, "BQ25896 detected on the I2C bus.");
         }
@@ -737,14 +805,13 @@ extern "C" void app_main(void)
             if (charger_ready && charger.BQ_disable_watchdog() != ESP_OK) {
                 ESP_LOGW(TAG, "Charger watchdog stayed armed during light sleep");
             }
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kRestLoopMs));
         } else {
             if (charger_ready && charger.BQ_pet_watchdog() != ESP_OK) {
                 ESP_LOGW(TAG, "Charger watchdog was not reset");
             }
             uint32_t loop_delay_ms = I2C_SCAN_PERIOD_MS;
-            if (firmware_update_pending() ||
-                (!ble_held && !wifi.is_connected() && network_settings.ssid[0] != '\0')) {
+            if (want_wifi || firmware_update_busy()) {
                 loop_delay_ms = 1000;
             } else if (led_on && led_blink && led_blink_interval_ms < I2C_SCAN_PERIOD_MS) {
                 loop_delay_ms = led_blink_interval_ms;
