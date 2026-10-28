@@ -31,6 +31,32 @@ Privacy: nessun account e nessun identificativo hardware. L'app genera una chiav
 
 La vecchia pagina HTTP locale e `emmaforo.local` sono spente (`CONFIG_EMMAFORO_HTTP_PORTAL`), perché non avevano password.
 
+## Speaker (scheda batch3)
+
+Amplificatore PAM8302: `~SD` su GPIO22 lo accende solo mentre suona, il segnale esce dal modulatore sigma-delta su GPIO23 e passa dal filtro 1 kΩ / 10 nF verso IN+. Campioni a 8 bit con segno a 8 kHz. Si toglie con `CONFIG_EMMAFORO_AUDIO` (menu *Emmaforo*); i pin si cambiano lì.
+
+Numeri dei suoni: `0` nessuno, `1` bip, `2` doppio bip, `3` din-don, `4` allarme, `5` melodia, `16`–`20` i cinque messaggi vocali scritti dall'app. Ogni stato della lampada (`rosso`, `giallo`, `verde`, `spento`, `altro` per ogni altro colore) ha un suono, che parte quando la lampada cambia colore con un comando. I passi di una catena hanno il loro suono.
+
+I messaggi vocali stanno nella partizione `audio` (0x3E0000, 128 KB): cinque posti da 24 576 byte, cioè circa 3 s ciascuno. Le schede aggiornate via OTA tengono la vecchia tabella delle partizioni, quindi senza un flash via USB hanno solo i suoni incorporati (l'ultimo campo della lettura di `FFEA` vale 0).
+
+Caratteristica `FFEA` (testo):
+
+- scrittura `vol:<0-100>`, `map:<stato>:<suono>`, `play:<suono>`, `stop`
+- scrittura `clip:begin:<posto 0-4>:<byte>` cancella il posto, poi i dati vanno su `FFE9`, poi `clip:end:<posto>:<crc32 esadecimale>` controlla e salva; `clip:del:<posto>` lo cancella
+- lettura `1\tvolume\trosso,giallo,verde,spento,altro\tmaschera messaggi\tms massimi per messaggio\tpartizione`
+
+Caratteristica `FFE9` (scrittura): `u32 offset` little-endian e poi i campioni, fino a 512 byte per scrittura. Il CRC è il CRC-32 standard (quello di `java.util.zip.CRC32`).
+
+## Catene di colori
+
+La lampada passa da sola attraverso fino a 16 colori. Ogni passo sfuma dal colore precedente al suo nel tempo di transizione, resta fermo per la pausa e, quando arriva, suona il suo suono. Con *ripeti* ricomincia dal primo passo. Un comando normale della luce, il riposo o una nuova catena la fermano. L'ultima catena resta in NVS.
+
+Caratteristica `FFEB` (binaria, little-endian):
+
+- scrittura `00` ferma, `02` riparte con la catena salvata
+- scrittura `01 flags n` e poi `n` passi da 8 byte: `r g b`, `u16 transizione`, `u16 pausa` (decimi di secondo, fino a 6553,5 s), `suono`. `flags` bit 0 = ripeti
+- lettura `attiva passo flags n` e poi gli stessi passi
+
 ## Batteria
 
 La cella (LP603048, 900 mAh) non viene mai caricata oltre il 95% circa: il BQ25896 regola a 4,16 V e termina a 64 mA. Quel punto è il 100% che l'utente vede, e ogni percentuale pubblicata via Bluetooth o HTTP è scalata di conseguenza (`battery_policy.h`). Corrente di carica normale 896 mA (1C), gentile 448 mA.

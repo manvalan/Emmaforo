@@ -55,4 +55,21 @@ menu "Emmaforo"
             The old setup page on the home network. It has no password, so it
             is off: Bluetooth and the encrypted remote link replace it.
 
+    config EMMAFORO_AUDIO
+        bool "Speaker (PAM8302 amplifier, batch3 board)"
+        default y
+        help
+            Tones and voice messages when the lamp changes color. The amplifier
+            is off between sounds. On boards without it the pins stay unused.
+
+    config EMMAFORO_AUDIO_SD_GPIO
+        int "GPIO that switches the amplifier on (~SD)"
+        depends on EMMAFORO_AUDIO
+        default 22
+
+    config EMMAFORO_AUDIO_SIGNAL_GPIO
+        int "GPIO with the sigma-delta audio signal"
+        depends on EMMAFORO_AUDIO
+        default 23
+
 endmenu

@@ -13,10 +13,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "audio_player.h"
 #include "battery_log.h"
 #include "battery_policy.h"
 #include "battery_status.h"
 #include "bluetooth_manager.h"
+#include "color_chain.h"
 #include "firmware_update.h"
 #include "max17048.h"
 #include "remote_link.h"
@@ -50,6 +52,22 @@ static bool parse_lamp_color(const char *text, SerialRgbLed::Color *color)
     }
     *color = {channels[0], channels[1], channels[2]};
     return true;
+}
+
+// The sound for a manual color change follows the named state; any other
+// color is "altro".
+static audio::LampState lamp_state_for(const char *text, SerialRgbLed::Color color)
+{
+    if (std::strcmp(text, "rosso") == 0) return audio::LampState::Rosso;
+    if (std::strcmp(text, "giallo") == 0) return audio::LampState::Giallo;
+    if (std::strcmp(text, "verde") == 0) return audio::LampState::Verde;
+    if (color.r == 0 && color.g == 0 && color.b == 0) return audio::LampState::Spento;
+    return audio::LampState::Altro;
+}
+
+static bool same_color(SerialRgbLed::Color a, SerialRgbLed::Color b)
+{
+    return a.r == b.r && a.g == b.g && a.b == b.b;
 }
 
 static uint8_t scale_channel(uint8_t channel, uint8_t level)
@@ -426,6 +444,16 @@ extern "C" void app_main(void)
     RemoteLink remote;
     remote.begin();
 
+#if CONFIG_EMMAFORO_AUDIO
+    ret = audio::init();
+    if (ret != ESP_OK) ESP_LOGE(TAG, "Speaker init failed: %s", esp_err_to_name(ret));
+#endif
+    ColorChain chain;
+    chain.load();
+    uint8_t chain_state[ColorChain::kMaxBytes + 1] = {};
+    bluetooth.set_chain_state(chain_state, chain.serialize(chain_state, sizeof(chain_state)));
+    int64_t last_probe_us = 0;
+
     SerialRgbLed::Color led_color = {0, 0, 0};
     bool led_blink = false;
     bool led_on = false;
@@ -594,6 +622,7 @@ extern "C" void app_main(void)
 
         if (portal.take_shutdown_command() || bluetooth.take_shutdown() || remote_rest) {
             resting = true;
+            chain.stop();
             led_on = false;
             led_blink = false;
             led_color = {};
@@ -630,6 +659,7 @@ extern "C" void app_main(void)
                 led_on = requested_color.r != 0 || requested_color.g != 0 || requested_color.b != 0;
             }
             led_phase = true;
+            chain.stop();
         }
 
         char ble_led_command[32] = {};
@@ -667,6 +697,12 @@ extern "C" void app_main(void)
                 }
                 SerialRgbLed::Color selected = {};
                 if ((target == 255 || target == 0) && parse_lamp_color(fields[1], &selected)) {
+                    const bool was_on = led_on;
+                    if (!same_color(selected, led_color) || was_on != (selected.r != 0 || selected.g != 0 || selected.b != 0) ||
+                        chain.running()) {
+                        audio::play_for_state(lamp_state_for(fields[1], selected));
+                    }
+                    chain.stop();
                     led_color = selected;
                     led_blink = blink != 0;
                     led_on = selected.r != 0 || selected.g != 0 || selected.b != 0;
@@ -674,6 +710,30 @@ extern "C" void app_main(void)
                 }
             }
         }
+
+        uint8_t chain_write[ColorChain::kMaxBytes] = {};
+        size_t chain_write_length = 0;
+        if (bluetooth.take_chain(chain_write, sizeof(chain_write), &chain_write_length)) {
+            const SerialRgbLed::Color current = led_on ? led_color : SerialRgbLed::Color{};
+            if (chain.apply(chain_write, chain_write_length, current, esp_timer_get_time())) {
+                if (chain.running()) {
+                    resting = false;
+                    configuration_led_mode = false;
+                    led_blink = false;
+                    led_phase = true;
+                }
+            } else {
+                ESP_LOGW(TAG, "Color chain not understood");
+            }
+        }
+        uint32_t chain_wait_ms = UINT32_MAX;
+        if (chain.running()) {
+            uint8_t chain_sound = 0;
+            chain_wait_ms = chain.update(esp_timer_get_time(), &led_color, &chain_sound);
+            led_on = led_color.r != 0 || led_color.g != 0 || led_color.b != 0 || chain.running();
+            if (chain_sound != 0) audio::play(chain_sound);
+        }
+        bluetooth.set_chain_state(chain_state, chain.serialize(chain_state, sizeof(chain_state)));
 
         const bool ble_connected = bluetooth.is_connected();
         const bool ble_held = bluetooth.link_is_held();
@@ -803,7 +863,9 @@ extern "C" void app_main(void)
 
         BatteryLogContext log_context = {};
         log_context.lamp_on = led_on;
-        log_context.led_load = static_cast<uint8_t>((shown_led.r + shown_led.g + shown_led.b) / 3);
+        // During a fade the shown color changes every frame: log where it is heading.
+        const SerialRgbLed::Color logged_led = chain.running() ? chain.target() : shown_led;
+        log_context.led_load = static_cast<uint8_t>((logged_led.r + logged_led.g + logged_led.b) / 3);
         log_context.wifi_on = wifi_on;
         log_context.ble_connected = ble_connected;
         log_context.resting = resting;
@@ -856,7 +918,13 @@ extern "C" void app_main(void)
                                               status.rate_centi_per_hour, status.gauge_alerts);
         }
 
-        if (status.voltage_mv != 0 || status.charge_state != 255) {
+        // A fading chain runs this loop every 20 ms: the log lines and the bus
+        // probe keep their usual pace.
+        const bool probe_due = now_us - last_probe_us >= static_cast<int64_t>(I2C_SCAN_PERIOD_MS) * 1000 ||
+                               last_probe_us == 0;
+        if (!probe_due) {
+            // Nothing to report.
+        } else if (status.voltage_mv != 0 || status.charge_state != 255) {
             ESP_LOGI(TAG, "Battery status: %u%% shown (%u.%u%% real%s), %u mV, state=%u", shown,
                      status.soc_x10 / 10, status.soc_x10 % 10, status.gauge ? ", gauge" : "",
                      status.voltage_mv, status.charge_state);
@@ -864,9 +932,11 @@ extern "C" void app_main(void)
             ESP_LOGW(TAG, "Battery status unavailable");
         }
 
-        int found = probe_bq25896_addresses(bus_handle);
+        const int found = probe_due ? probe_bq25896_addresses(bus_handle) : 1;
+        if (probe_due) last_probe_us = now_us;
 
-        if (found < 0) {
+        if (!probe_due) {
+        } else if (found < 0) {
             ESP_LOGE(TAG, "I2C bus error detected: the bus is not healthy.");
         } else if (found == 0) {
             ESP_LOGW(TAG, "BQ25896 not found at 0x%02X.", BQ::kDefaultAddress);
@@ -893,6 +963,7 @@ extern "C" void app_main(void)
                 loop_delay_ms = led_blink_interval_ms;
             }
             if (remote.session_active()) loop_delay_ms = std::min<uint32_t>(loop_delay_ms, 1000);
+            loop_delay_ms = std::min(loop_delay_ms, chain_wait_ms);
             loop_delay_ms = std::min(loop_delay_ms, remote.next_wake_ms(esp_timer_get_time()));
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(loop_delay_ms));
         }

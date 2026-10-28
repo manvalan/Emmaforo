@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include "audio_player.h"
 #include "battery_log.h"
+#include "color_chain.h"
 #include "sdkconfig.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
@@ -112,6 +114,15 @@ const ble_uuid16_t kRemoteUuid = BLE_UUID16_INIT(0xFFEC);
 char pending_remote_command[200] = {};
 bool remote_command_requested = false;
 char remote_status[96] = {};
+// Added for the batch3 board (speaker) and color chains.
+const ble_uuid16_t kChainUuid = BLE_UUID16_INIT(0xFFEB);
+const ble_uuid16_t kAudioUuid = BLE_UUID16_INIT(0xFFEA);
+const ble_uuid16_t kAudioClipUuid = BLE_UUID16_INIT(0xFFE9);
+uint8_t pending_chain[ColorChain::kMaxBytes] = {};
+size_t pending_chain_length = 0;
+bool chain_requested = false;
+uint8_t chain_state[ColorChain::kMaxBytes + 1] = {};
+size_t chain_state_length = 0;
 
 // Fields 0-9 are what app 1.0 parses. Fields 10-12 were added later and are
 // ignored by it: gauge present, rate in 0.1 %/h, gauge alert flags.
@@ -272,6 +283,53 @@ int gatt_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_acce
         remote_command_requested = true;
         wake_app_task();
         return 0;
+    }
+
+    if (ctxt->chr != nullptr && ble_uuid_cmp(ctxt->chr->uuid, &kChainUuid.u) == 0) {
+        if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+            if (ctxt->offset > chain_state_length) return BLE_ATT_ERR_INVALID_OFFSET;
+            return os_mbuf_append(ctxt->om, chain_state + ctxt->offset, chain_state_length - ctxt->offset) == 0
+                ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+        const uint16_t length = OS_MBUF_PKTLEN(ctxt->om);
+        if (length == 0 || length > sizeof(pending_chain) || chain_requested ||
+            ble_hs_mbuf_to_flat(ctxt->om, pending_chain, length, nullptr) != 0) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        pending_chain_length = length;
+        chain_requested = true;
+        wake_app_task();
+        return 0;
+    }
+
+    if (ctxt->chr != nullptr && ble_uuid_cmp(ctxt->chr->uuid, &kAudioUuid.u) == 0) {
+        if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+            char text[64] = {};
+            const int length = audio::format_status(text, sizeof(text));
+            if (length < 0 || ctxt->offset > length) return BLE_ATT_ERR_INVALID_OFFSET;
+            return os_mbuf_append(ctxt->om, text + ctxt->offset, static_cast<size_t>(length) - ctxt->offset) == 0
+                ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+        char command[48] = {};
+        const uint16_t length = OS_MBUF_PKTLEN(ctxt->om);
+        if (length == 0 || length >= sizeof(command) ||
+            ble_hs_mbuf_to_flat(ctxt->om, command, length, nullptr) != 0) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        command[length] = '\0';
+        return audio::handle_command(command) ? 0 : BLE_ATT_ERR_UNLIKELY;
+    }
+
+    if (ctxt->chr != nullptr && ble_uuid_cmp(ctxt->chr->uuid, &kAudioClipUuid.u) == 0) {
+        if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+        uint8_t chunk[516] = {};
+        const uint16_t length = OS_MBUF_PKTLEN(ctxt->om);
+        if (length <= 4 || length > sizeof(chunk) || ble_hs_mbuf_to_flat(ctxt->om, chunk, length, nullptr) != 0) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        return audio::handle_clip_data(chunk, length) ? 0 : BLE_ATT_ERR_UNLIKELY;
     }
 
     if (ctxt->chr != nullptr && ble_uuid_cmp(ctxt->chr->uuid, &kBatteryLogUuid.u) == 0) {
@@ -634,6 +692,23 @@ const ble_gatt_svc_def services[] = {
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &battery_log_handle,
             },
+            {
+                .uuid = &kChainUuid.u,
+                .access_cb = gatt_access,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+            },
+#if CONFIG_EMMAFORO_AUDIO
+            {
+                .uuid = &kAudioUuid.u,
+                .access_cb = gatt_access,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
+            },
+            {
+                .uuid = &kAudioClipUuid.u,
+                .access_cb = gatt_access,
+                .flags = BLE_GATT_CHR_F_WRITE,
+            },
+#endif
 #if CONFIG_EMMAFORO_REMOTE
             {
                 .uuid = &kRemoteUuid.u,
@@ -966,4 +1041,20 @@ bool BluetoothManager::take_remote_command(char *command, size_t command_size)
 void BluetoothManager::set_remote_status(const char *status)
 {
     std::snprintf(remote_status, sizeof(remote_status), "%s", status == nullptr ? "" : status);
+}
+
+bool BluetoothManager::take_chain(uint8_t *data, size_t size, size_t *length)
+{
+    if (!chain_requested || data == nullptr || length == nullptr || size < pending_chain_length) return false;
+    std::memcpy(data, pending_chain, pending_chain_length);
+    *length = pending_chain_length;
+    chain_requested = false;
+    return true;
+}
+
+void BluetoothManager::set_chain_state(const uint8_t *data, size_t length)
+{
+    if (data == nullptr || length > sizeof(chain_state)) return;
+    std::memcpy(chain_state, data, length);
+    chain_state_length = length;
 }

@@ -37,6 +37,9 @@ public:
     // FFEC: remote control settings ("on", "off", "interval:N", "broker:", "user:", "pass:").
     bool take_remote_command(char *command, size_t command_size);
     void set_remote_status(const char *status);
+    // FFEB: color chain written by the app (see color_chain.h), and what it reads back.
+    bool take_chain(uint8_t *data, size_t size, size_t *length);
+    void set_chain_state(const uint8_t *data, size_t length);
 
 private:
     bool initialized_;
