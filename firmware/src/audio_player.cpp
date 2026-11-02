@@ -1,5 +1,6 @@
 #include "audio_player.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
+#include "power_debug.h"
 
 namespace audio {
 namespace {
@@ -39,6 +41,12 @@ constexpr uint32_t kRingMask = kRingSize - 1;
 // The coupling capacitor settles at the mid level before the amplifier wakes,
 // so it does not click.
 constexpr uint32_t kSettleMs = 30;
+// The PAM8302 has a gain of about 13.6 here (150 kΩ / (10 kΩ + 1 kΩ)), so it
+// clips at about 0.27 V on its input with the cell at 3.7 V. One density step
+// is 3.3 V / 256 = 12.9 mV: volume 100 stops at 20 steps, or 0.26 V.
+constexpr int32_t kFullScaleDensity = 20;
+// Above the 250 kHz of the amplifier, and less ripple through 1 kΩ/10 nF.
+constexpr uint32_t kSdmRateHz = 5000000;
 
 struct VoiceHeader {
     uint32_t magic;
@@ -90,6 +98,7 @@ uint8_t volume = 70;
 uint8_t state_map[static_cast<size_t>(LampState::Count)] = {};
 int upload_slot = -1;
 uint32_t upload_length = 0;
+int32_t density_error = 0;
 
 bool IRAM_ATTR on_sample(gptimer_handle_t, const gptimer_alarm_event_data_t *, void *)
 {
@@ -165,7 +174,12 @@ bool push(int8_t sample)
         if (should_stop()) return false;
         vTaskDelay(pdMS_TO_TICKS(5));
     }
-    ring[ring_head & kRingMask] = static_cast<int8_t>((static_cast<int>(sample) * volume) / 100);
+    // Only 41 levels fit under the clipping point: the rounding error carries
+    // over to the next sample, which moves the noise up to where it is less heard.
+    density_error += static_cast<int32_t>(sample) * volume * kFullScaleDensity * 256 / (127 * 100);
+    const int32_t density = density_error >> 8;
+    density_error -= density * 256;
+    ring[ring_head & kRingMask] = static_cast<int8_t>(density);
     ring_head = ring_head + 1;
     return true;
 }
@@ -212,10 +226,30 @@ bool play_voice(int slot)
     return true;
 }
 
-void hardware_on()
+void release_signal_pin()
 {
+    gpio_config_t idle = {};
+    idle.pin_bit_mask = 1ULL << kSignalGpio;
+    idle.mode = GPIO_MODE_DISABLE;
+    gpio_config(&idle);
+}
+
+// The sigma-delta clock has no off switch of its own: it stops only when the
+// channel is deleted. A channel left alive keeps toggling the pin into 10 nF.
+bool hardware_on()
+{
+    sdm_config_t sdm_config = {};
+    sdm_config.gpio_num = kSignalGpio;
+    sdm_config.clk_src = SDM_CLK_SRC_DEFAULT;
+    sdm_config.sample_rate_hz = kSdmRateHz;
+    const esp_err_t ret = sdm_new_channel(&sdm_config, &sdm);
+    if (ret != ESP_OK) {
+        ESP_LOGE(kTag, "Sigma-delta channel failed: %s", esp_err_to_name(ret));
+        return false;
+    }
     if (pm_lock != nullptr) esp_pm_lock_acquire(pm_lock);
     ring_tail = ring_head;
+    density_error = 0;
     sdm_channel_enable(sdm);
     sdm_channel_set_pulse_density(sdm, 0);
     gptimer_enable(timer);
@@ -223,6 +257,7 @@ void hardware_on()
     vTaskDelay(pdMS_TO_TICKS(kSettleMs));
     gpio_set_level(kShutdownGpio, 1);
     vTaskDelay(pdMS_TO_TICKS(kSettleMs));
+    return true;
 }
 
 void hardware_off()
@@ -232,6 +267,9 @@ void hardware_off()
     gptimer_disable(timer);
     sdm_channel_set_pulse_density(sdm, 0);
     sdm_channel_disable(sdm);
+    sdm_del_channel(sdm);
+    sdm = nullptr;
+    release_signal_pin();
     ring_tail = ring_head;
     if (pm_lock != nullptr) esp_pm_lock_release(pm_lock);
 }
@@ -244,9 +282,20 @@ void audio_task(void *)
         while (xQueueReceive(requests, &sound, 0) == pdTRUE) {
         }
         if (sound == kSoundNone) continue;
+        // A state can still point to a voice that is not there, for example
+        // on a board updated over the air: stay silent, amplifier off.
+        if (sound >= kVoiceFirst && (partition == nullptr || !voice_present(sound - kVoiceFirst))) {
+            ESP_LOGI(kTag, "Sound %u is not on this board", sound);
+            continue;
+        }
         abort_requested = false;
         busy = true;
-        hardware_on();
+        power_debug::audio_started(sound);
+        if (!hardware_on()) {
+            busy = false;
+            power_debug::audio_stopped();
+            continue;
+        }
         bool finished = false;
         if (sound >= 1 && sound <= kToneCount) {
             finished = play_tone(kTones[sound - 1]);
@@ -256,6 +305,7 @@ void audio_task(void *)
         while (finished && ring_tail != ring_head && !should_stop()) vTaskDelay(pdMS_TO_TICKS(5));
         hardware_off();
         busy = false;
+        power_debug::audio_stopped();
     }
 }
 
@@ -355,12 +405,7 @@ esp_err_t init()
     if (ret != ESP_OK) return ret;
     gpio_set_level(kShutdownGpio, 0);
 
-    sdm_config_t sdm_config = {};
-    sdm_config.gpio_num = kSignalGpio;
-    sdm_config.clk_src = SDM_CLK_SRC_DEFAULT;
-    sdm_config.sample_rate_hz = 1000000;
-    ret = sdm_new_channel(&sdm_config, &sdm);
-    if (ret != ESP_OK) return ret;
+    release_signal_pin();
 
     gptimer_config_t timer_config = {};
     timer_config.clk_src = GPTIMER_CLK_SRC_DEFAULT;
@@ -390,6 +435,10 @@ esp_err_t init()
     // Boards updated over the air keep their old partition table, which has
     // no room for voices: they still play the built-in tones.
     partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "audio");
+    if (partition != nullptr && partition->size < slot_offset(kVoiceSlots)) {
+        ESP_LOGW(kTag, "Audio partition is too small: ignored");
+        partition = nullptr;
+    }
     if (partition != nullptr && esp_partition_read(partition, 0, headers, sizeof(headers)) != ESP_OK) {
         std::memset(headers, 0, sizeof(headers));
     }

@@ -6,8 +6,10 @@
 #include "esp_err.h"
 
 // Speaker on the batch3 board: a PAM8302 class-D amplifier. ~SD (GPIO22)
-// switches it on, the sigma-delta output on GPIO23 goes through 1 kΩ/10 nF
-// into IN+. Samples are signed 8-bit at 8 kHz.
+// (active high, 10 kΩ pull-down on the board) switches it on, the sigma-delta
+// output on GPIO23 goes through 1 kΩ/10 nF and 100 nF into IN+. Samples are
+// signed 8-bit at 8 kHz. Between sounds the amplifier is off and the
+// sigma-delta channel does not exist.
 //
 // Sounds are numbered: 0 none, 1-5 built-in tones, 16-20 the five voice
 // messages the app writes into the "audio" partition. Every lamp state

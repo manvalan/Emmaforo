@@ -1,0 +1,6 @@
+# Power debug build, on top of sdkconfig.defaults. Use tools/debug_power.sh.
+# Never publish this image: it is for test boards on USB flash only.
+CONFIG_EMMAFORO_DEBUG_POWER=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_debug_power.csv"
+# The RAM battery log the app can read follows the same pace.
+CONFIG_EMMAFORO_BATTERY_LOG_PERIOD_S=30

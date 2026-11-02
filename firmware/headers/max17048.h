@@ -35,6 +35,9 @@ public:
     esp_err_t read_rate_centi_percent_per_hour(int16_t *rate) const;
     esp_err_t read_alerts(uint8_t *alerts) const;
     esp_err_t clear_alerts(uint8_t alerts);
+    // Hibernating, the gauge converts every 45 s instead of every 250 ms.
+    // begin() always allows it: the register outlives a firmware change.
+    esp_err_t set_hibernate_allowed(bool allowed);
 
 private:
     esp_err_t read16(uint8_t reg, uint16_t *value) const;

@@ -9,6 +9,7 @@ constexpr int kTimeoutMs = 100;
 constexpr uint8_t kRegVcell = 0x02;
 constexpr uint8_t kRegSoc = 0x04;
 constexpr uint8_t kRegVersion = 0x08;
+constexpr uint8_t kRegHibernate = 0x0A;
 constexpr uint8_t kRegConfig = 0x0C;
 constexpr uint8_t kRegValrt = 0x14;
 constexpr uint8_t kRegCrate = 0x16;
@@ -18,6 +19,9 @@ constexpr uint16_t kConfigAlrt = 0x0020;
 constexpr uint16_t kConfigAthdMask = 0x001F;
 constexpr uint16_t kConfigSleep = 0x0080;
 constexpr uint16_t kConfigAlsc = 0x0040;
+// HIBRT: the power-on thresholds, and the value that never hibernates.
+constexpr uint16_t kHibernateDefault = 0x8030;
+constexpr uint16_t kHibernateNever = 0x0000;
 }
 
 Max17048::Max17048(i2c_master_bus_handle_t bus)
@@ -73,6 +77,9 @@ esp_err_t Max17048::begin(uint8_t empty_alert_percent, uint16_t low_alert_mv, ui
 
     const uint16_t valrt = static_cast<uint16_t>(((low_alert_mv / 20) << 8) | ((high_alert_mv / 20) & 0xFF));
     ret = write16(kRegValrt, valrt);
+    if (ret != ESP_OK) return ret;
+
+    ret = set_hibernate_allowed(true);
     if (ret != ESP_OK) return ret;
 
     uint8_t alerts = 0;
@@ -141,6 +148,11 @@ esp_err_t Max17048::clear_alerts(uint8_t alerts)
         ret = write16(kRegConfig, static_cast<uint16_t>(config & ~kConfigAlrt));
     }
     return ret;
+}
+
+esp_err_t Max17048::set_hibernate_allowed(bool allowed)
+{
+    return write16(kRegHibernate, allowed ? kHibernateDefault : kHibernateNever);
 }
 
 esp_err_t Max17048::read16(uint8_t reg, uint16_t *value) const

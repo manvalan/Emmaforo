@@ -21,6 +21,7 @@
 #include "color_chain.h"
 #include "firmware_update.h"
 #include "max17048.h"
+#include "power_debug.h"
 #include "remote_link.h"
 #include "serial_rgb_led.h"
 #include "settings_store.h"
@@ -452,6 +453,8 @@ extern "C" void app_main(void)
     chain.load();
     uint8_t chain_state[ColorChain::kMaxBytes + 1] = {};
     bluetooth.set_chain_state(chain_state, chain.serialize(chain_state, sizeof(chain_state)));
+    power_debug::begin(charger_ready ? &charger : nullptr, gauge_ready ? &gauge : nullptr,
+                       remembered_known ? remembered_percent : 0);
     int64_t last_probe_us = 0;
 
     SerialRgbLed::Color led_color = {0, 0, 0};
@@ -870,6 +873,8 @@ extern "C" void app_main(void)
         log_context.ble_connected = ble_connected;
         log_context.resting = resting;
         battery_log::record(status, log_context);
+        power_debug::set_state({shown_led.r, shown_led.g, shown_led.b, led_on, led_blink, ble_connected, wifi_on,
+                                resting, status.valid ? status.percent : uint8_t{0}});
 
         if (remote.enabled()) {
             char state_json[192] = {};

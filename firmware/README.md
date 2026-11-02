@@ -33,7 +33,9 @@ La vecchia pagina HTTP locale e `emmaforo.local` sono spente (`CONFIG_EMMAFORO_H
 
 ## Speaker (scheda batch3)
 
-Amplificatore PAM8302: `~SD` su GPIO22 lo accende solo mentre suona, il segnale esce dal modulatore sigma-delta su GPIO23 e passa dal filtro 1 kΩ / 10 nF verso IN+. Campioni a 8 bit con segno a 8 kHz. Si toglie con `CONFIG_EMMAFORO_AUDIO` (menu *Emmaforo*); i pin si cambiano lì.
+Amplificatore PAM8302 alimentato da VSYS: `~SD` su GPIO22 (attivo alto, con 10 kΩ verso massa sulla scheda) lo accende solo mentre suona, il segnale esce dal modulatore sigma-delta su GPIO23 a 5 MHz e passa da 1 kΩ / 10 nF e 100 nF verso IN+. Campioni a 8 bit con segno a 8 kHz. Tra un suono e l'altro il canale sigma-delta non esiste e il pin è scollegato. Si toglie con `CONFIG_EMMAFORO_AUDIO` (menu *Emmaforo*); i pin si cambiano lì.
+
+Con questo schema l'ampli guadagna circa 13,6 volte e satura già con 0,27 V in ingresso, cioè 21 gradini del modulatore su 128: il volume 100 si ferma a 20 gradini. Per usare tutta la scala servirebbe un partitore sul segnale in una prossima revisione della scheda.
 
 Numeri dei suoni: `0` nessuno, `1` bip, `2` doppio bip, `3` din-don, `4` allarme, `5` melodia, `16`–`20` i cinque messaggi vocali scritti dall'app. Ogni stato della lampada (`rosso`, `giallo`, `verde`, `spento`, `altro` per ogni altro colore) ha un suono, che parte quando la lampada cambia colore con un comando. I passi di una catena hanno il loro suono.
 
@@ -79,6 +81,34 @@ Protocollo, caratteristica `FFED` del servizio `FFF0`:
 - scrittura `clear`: azzera il registro
 
 Formato del campione in `headers/battery_log.h`. La caratteristica batteria `FFF9` ha in coda tre campi nuovi (gauge presente, variazione in 0,1 %/h, avvisi del gauge) che l'app 1.0 ignora.
+
+## Firmware di debug dei consumi
+
+Variante solo per le schede di test, versione `1.2-debug`, da caricare via USB. **Non va mai pubblicata**: `version.txt` sul sito non si tocca. Ha una cartella di build e una configurazione proprie (`sdkconfig.debug_power`, `CONFIG_EMMAFORO_DEBUG_POWER`) e una tabella delle partizioni con 256 KB in più per il registro, presi dalla fine di `ota_1`; le altre partizioni non si spostano.
+
+```bash
+tools/debug_power.sh flash            # compila e carica
+tools/debug_power.sh monitor          # righe in diretta, iniziano con PWR,
+tools/debug_power.sh read prova.csv   # copia il registro dalla scheda in CSV
+tools/debug_power.sh clear            # svuota il registro
+```
+
+Ogni 30 s (`CONFIG_EMMAFORO_DEBUG_POWER_PERIOD_S`) scrive una riga nella partizione `powerlog`, che resiste allo stacco della batteria: 8064 righe, circa 67 ore, poi riparte sovrascrivendo le più vecchie. A batteria non scrive sulla seriale, perché la porta esiste solo via USB. Con l'USB collegato resta sveglia per tenere viva la seriale: **la misura vale solo a batteria** (`power_good` = 0).
+
+La scheda non ha un sensore di corrente: `drain_ma` è `rate_centi` del gauge per 900 mAh, e il gauge aggiorna il rate lentamente, quindi vale come media su decine di minuti.
+
+| Colonne | Significato |
+| --- | --- |
+| `seq`, `uptime_s` | numero di riga, secondi dall'avvio (torna a zero a ogni avvio) |
+| `type` | `periodic` oppure `audio`, una riga a fine suono |
+| `mv`, `soc_x10`, `rate_centi`, `drain_ma` | tensione, carica reale in 0,1 %, velocità in 0,01 %/h, consumo stimato |
+| `min_mv`, `sound`, `audio_ms` | righe `audio`: tensione minima durante il suono, 1 s dopo la fine c'è `mv`; numero e durata del suono |
+| `charge_ma`, `vbus_mv`, `charge_state`, `power_good`, `charging`, `fault` | stato del BQ25896 |
+| `r`, `g`, `b`, `lamp_on`, `blink`, `ble`, `wifi`, `resting`, `audio` | stato del sistema, LED dopo la luminosità |
+| `sleep_permille`, `wakeups` | tempo in light sleep (‰) e risvegli dalla riga precedente |
+| `autonomy_min` | autonomia residua stimata: media da quando è stata staccata dopo 10 minuti e 0,5 % consumati, prima dal rate del gauge; vuota se non si può stimare |
+
+Il gauge in questa variante non va in ibernazione, per avere tensioni fresche durante i suoni. Il firmware normale la riattiva all'avvio. Il registro batteria in RAM (`FFED`) passa a un campione ogni 30 s e si legge anche dall'app di test.
 
 ## Compilazione
 

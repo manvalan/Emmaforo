@@ -72,4 +72,22 @@ menu "Emmaforo"
         depends on EMMAFORO_AUDIO
         default 23
 
+    config EMMAFORO_DEBUG_POWER
+        bool "Power debug log (never publish this build)"
+        default n
+        select PM_LIGHT_SLEEP_CALLBACKS
+        help
+            Logs battery, charger and system state to the USB serial port and
+            to the "powerlog" flash partition, so a discharge can be measured
+            with nothing plugged in. Build it with tools/debug_power.sh, which
+            also brings the partition table that has room for the log.
+
+    config EMMAFORO_DEBUG_POWER_PERIOD_S
+        int "Seconds between power log rows"
+        depends on EMMAFORO_DEBUG_POWER
+        range 10 300
+        default 30
+        help
+            The partition holds 8064 rows: 67 hours at 30 s.
+
 endmenu
